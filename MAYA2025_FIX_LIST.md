@@ -12,25 +12,25 @@
 
 ## README 機能別 修正サマリー
 
-| README の機能項目                                        | 修正前の問題                                                                                                                     |                                        対応状況                                        |
-| :------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------: | ------ |
-| **インストール（ApplicationPlugins / 起動）**            | `PackageContents.xml` の `<Components>` が `win64` のみ／Qt6 非推奨属性 `AA_EnableHighDpiScaling` 呼び出し                       |                                         修正済                                         |
-| **基本 UI 表示 2（0-1 / 0-100）**                        | `QButtonGroup.button(int)` へ `float` を渡していた                                                                               |                                         修正済                                         |
-| **ジョイント選択（ヘッダー右クリック）**                 | `original_selection` の `None` 参照・列外クリック時の範囲外アクセス                                                              |                                         修正済                                         |
-| **入力方法 4 種類（スピンボックス / スライダー等）**     | Qt6 廃止済み `QApplication.setActiveWindow()`・`QWheelEvent.delta()` 呼び出しでクラッシュ                                        |                                         修正済                                         |
-| **入力モード / 検索 UI**                                 | `self.add_but`・`self.clear_search_but` の属性名重複上書き                                                                       |                                         修正済                                         |
-| **ウェイトロック（Lock Wt / Unlock Wt 右クリック）**     | Maya 2022+ の `columnIntersectsSelection` 引数仕様変更未対応で全頂点ロックが機能しない                                           |                                         修正済                                         |
-| **スムース設定ウィンドウ（SS ボタン）**                  | `QSlider.setValue(float)` で起動時に `TypeError` クラッシュ＋ホイール操作でクラッシュ                                            |                                         修正済                                         |
-| **Freeze / Freeze_M**                                    | Maya 2022+ クラスター（`componentTags`）で `IndexError`、子無しノードで `TypeError`、未スキニング時のシェイプ誤削除リスク        |                                         修正済                                         |
-| **Simple Weight Copy / Paste**                           | アトリビュート名に余計な半角スペース（`' .skm'` 等）、`protect_pat` タイポ、`xml_name` 未定義リスク                              |                                         修正済                                         |
-| **Transfer Weight Multiple**                             | コンポーネント選択が頂点（`float3`）のみ対象、`cmds.skinCluster` にトランスフォーム渡し、`WINDOW` 未チェック                     |                                         修正済                                         |
-| **Vertex Weight Copy / Paste**                           | `cmds.skinCluster` にトランスフォーム渡し、右クリックメニューが `exec_()` でクラッシュ                                           |                                         修正済                                         |
-| **Excel like Cell Copy / Paste（右クリックメニュー）**   | PySide6 廃止済み `QMenu.exec_()` 呼び出しで確実にクラッシュ                                                                      |                                         修正済                                         |
-| **Weight_Symmetrize / Auto_Symmetry / 命名規則エディタ** | 未使用の `import imp` による Python 3.12+ 起動エラー、`_R` 末尾リネームのタイポ、ブレンドシェイプ併用時の `skinCluster` 取得失敗 |                                         修正済                                         |
-| **Mesh Marge with Skinning**                             | フルパス記号 `                                                                                                                   | `付きで`cmds.rename`して`RuntimeError`、`qt.Callback` 呼び出しミスで Undo チャンク無効 | 修正済 |
-| **Toggle Mute Skinning**                                 | 子無しメッシュ選択時に `cmds.ls(None, type='transform')` でシーン全メッシュがミュートされる                                      |                                         修正済                                         |
-| **Go Maya Export / Import**                              | `.json` ファイルを `.ma` として読み込もうとして確実にエラー                                                                      |                                         修正済                                         |
-| **Add / Remove / Remove Unused Influences**              | `weighted_influences` が `None` で `TypeError`、`cmds.skinCluster` へのノード直接渡し                                            |                                         修正済                                         |
+| README の機能項目 | 修正前の問題 | 対応状況 |
+| :--- | :--- | :---: |
+| **インストール（ApplicationPlugins / 起動）** | `PackageContents.xml` の `<Components>` が `win64` のみ／Qt6 非推奨属性 `AA_EnableHighDpiScaling` 呼び出し | 修正済 |
+| **基本 UI 表示 2（0-1 / 0-100）** | `QButtonGroup.button(int)` へ `float` を渡していた | 修正済 |
+| **ジョイント選択（ヘッダー右クリック）** | `original_selection` の `None` 参照・列外クリック時の範囲外アクセス | 修正済 |
+| **入力方法 4 種類（スピンボックス / スライダー等）** | Qt6 廃止済み `QApplication.setActiveWindow()`・`QWheelEvent.delta()` 呼び出しでクラッシュ | 修正済 |
+| **入力モード / 検索 UI** | `self.add_but`・`self.clear_search_but` の属性名重複上書き | 修正済 |
+| **ウェイトロック（Lock Wt / Unlock Wt 右クリック）** | Maya 2022+ の `columnIntersectsSelection` 引数仕様変更未対応で全頂点ロックが機能しない | 修正済 |
+| **スムース設定ウィンドウ（SS ボタン）** | `QSlider.setValue(float)` で起動時に `TypeError` クラッシュ＋ホイール操作でクラッシュ | 修正済 |
+| **Freeze / Freeze_M** | Maya 2022+ クラスター（`componentTags`）で `IndexError`、子無しノードで `TypeError`、未スキニング時のシェイプ誤削除リスク | 修正済 |
+| **Simple Weight Copy / Paste** | アトリビュート名に余計な半角スペース（`' .skm'` 等）、`protect_pat` タイポ、`xml_name` 未定義リスク | 修正済 |
+| **Transfer Weight Multiple** | コンポーネント選択が頂点（`float3`）のみ対象、`cmds.skinCluster` にトランスフォーム渡し、`WINDOW` 未チェック | 修正済 |
+| **Vertex Weight Copy / Paste** | `cmds.skinCluster` にトランスフォーム渡し、右クリックメニューが `exec_()` でクラッシュ | 修正済 |
+| **Excel like Cell Copy / Paste（右クリックメニュー）** | PySide6 廃止済み `QMenu.exec_()` 呼び出しで確実にクラッシュ | 修正済 |
+| **Weight_Symmetrize / Auto_Symmetry / 命名規則エディタ** | 未使用の `import imp` による Python 3.12+ 起動エラー、`_R` 末尾リネームのタイポ、ブレンドシェイプ併用時の `skinCluster` 取得失敗 | 修正済 |
+| **Mesh Marge with Skinning** | フルパス記号（パイプ記号）付きで `cmds.rename` して `RuntimeError`、`qt.Callback` 呼び出しミスで Undo チャンク無効 | 修正済 |
+| **Toggle Mute Skinning** | 子無しメッシュ選択時に `cmds.ls(None, type='transform')` でシーン全メッシュがミュートされる | 修正済 |
+| **Go Maya Export / Import** | `.json` ファイルを `.ma` として読み込もうとして確実にエラー | 修正済 |
+| **Add / Remove / Remove Unused Influences** | `weighted_influences` が `None` で `TypeError`、`cmds.skinCluster` へのノード直接渡し | 修正済 |
 
 ---
 
