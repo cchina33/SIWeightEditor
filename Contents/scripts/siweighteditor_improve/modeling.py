@@ -77,8 +77,40 @@ def face_extraction(faces=None, deleteOrg=True, selectDuplicated=True, transferW
         cmds.select(duplicated)
     return duplicated
     
-#クラスタデフォーマの書き戻し
+# クラスタデフォーマの書き戻し（Maya 2022 以降の componentTags 仕様にも対応）
 class ClusterCopy():
+    def _get_cluster_vertices(self, cls, mesh):
+        """クラスターが影響する頂点リストを objectSet / componentTags の両方に対応して取得する。"""
+        set_nodes = cmds.ls(cmds.listHistory(cls, f=True) or [], type='objectSet', l=True) or []
+        if set_nodes:
+            cmds.select(set_nodes[0], r=True)
+            vertices = cmds.filterExpand(cmds.ls(sl=True) or [], sm=31) or []
+            if vertices:
+                return vertices
+
+        # Maya 2022 以降の componentTags ベースでは deformer -q -components で取得を試みる
+        try:
+            comp_members = cmds.deformer(cls, q=True, components=True) or []
+            if comp_members:
+                vertices = cmds.filterExpand(comp_members, sm=31) or []
+                if vertices:
+                    return vertices
+        except Exception:
+            pass
+
+        # フォールバックとして対象メッシュの頂点一覧からクラスター影響頂点を抽出する
+        all_vtx = cmds.filterExpand(cmds.polyListComponentConversion(mesh, tv=True) or [], sm=31) or []
+        if not all_vtx:
+            return []
+        try:
+            all_weights = cmds.percent(cls, all_vtx, q=True, v=True) or []
+            if len(all_weights) == len(all_vtx):
+                weighted_vtx = [v for v, w in zip(all_vtx, all_weights) if w > 0.0]
+                return weighted_vtx or all_vtx
+        except Exception:
+            pass
+        return all_vtx
+
     def copy(self, mesh):
         self.cluster_list = []
         self.point_dict = {}
@@ -87,44 +119,51 @@ class ClusterCopy():
         dummy = common.TemporaryReparent().main(mode='create')
         common.TemporaryReparent().main(mesh, dummyParent=dummy, mode='cut')
         
-        cluster = cmds.ls(cmds.listHistory(mesh), type='cluster', l=True)
-        for cls in cluster:
-            set_node = cmds.ls(cmds.listHistory(cls, f=True), type='objectSet', l=True)[0]
-            cmds.select(set_node)
-            vertices = cmds.ls(sl=True)
-            vertices = cmds.filterExpand(vertices, sm=31)
+        clusters = cmds.ls(cmds.listHistory(mesh) or [], type='cluster', l=True) or []
+        for cls in clusters:
+            vertices = self._get_cluster_vertices(cls, mesh)
+            if not vertices:
+                continue
             cmds.select(vertices, r=True)
             try:
-                weights = cmds.percent(cls, q=True, v=True)
-                print(weights)
-            #値が取れないときアンドゥするとなぜか直ることがある
+                weights = cmds.percent(cls, q=True, v=True) or []
             except Exception as e:
                 print('{}'.format(e))
-                cmds.delete(cls)
-                cmds.undo()
-                set_node = cmds.ls(cmds.listHistory(cls, f=True), type='objectSet', l=True)[0]
-                vertices = cmds.ls(sl=True)
-                vertices = cmds.filterExpand(vertices, sm=31)
-                cmds.select(vertices, r=True)
-                weights = cmds.percent(cls, q=True, v=True)
+                try:
+                    cmds.delete(cls)
+                    cmds.undo()
+                    vertices = self._get_cluster_vertices(cls, mesh)
+                    if not vertices:
+                        continue
+                    cmds.select(vertices, r=True)
+                    weights = cmds.percent(cls, q=True, v=True) or []
+                except Exception as retry_e:
+                    print('{}'.format(retry_e))
+                    continue
+            if not weights:
+                continue
             self.cluster_list.append(cls)
             self.cls_weight_dict[cls] = weights
             self.point_dict[cls] = vertices
-        common.TemporaryReparent().main(mesh, dummyParent=dummy, mode='parent')#コピーのおわったメッシュの子供を元に戻す
-        common.TemporaryReparent().main(dummyParent=dummy, mode='delete')#ダミー親削除
+        common.TemporaryReparent().main(mesh, dummyParent=dummy, mode='parent')  # コピーの終わったメッシュの子供を元に戻す
+        common.TemporaryReparent().main(dummyParent=dummy, mode='delete')  # ダミー親削除
         return self.point_dict, self.cls_weight_dict
         
     def paste(self, mesh):
         if not self.cluster_list:
-            return
+            return None
+        newcls = None
         for cls in self.cluster_list:
-            weights = self.cls_weight_dict[cls]
-            print('paste cls :',cls)
-            cmds.select(cl=True)            
-            points = self.point_dict[cls]
-            newcls = cmds.cluster(points, n=cls)
-            for i, v in enumerate(points):
-                cmds.percent(newcls[0], v, v=(weights[i])) 
+            weights = self.cls_weight_dict.get(cls) or []
+            points = self.point_dict.get(cls) or []
+            if not points:
+                continue
+            print('paste cls :', cls)
+            cmds.select(cl=True)
+            cls_name = cls.split('|')[-1]
+            newcls = cmds.cluster(points, n=cls_name)
+            for v, w in zip(points, weights):
+                cmds.percent(newcls[0], v, v=w)
         return newcls
         
 #ポリゴンメッシュをウェイト付きで複製する関数
@@ -141,9 +180,9 @@ def duplicate_with_skin(nodes, parentNode=None):
         common.TemporaryReparent().main(node,dummyParent=dummy, mode='cut')
         #複製
         dup = cmds.duplicate(node)[0]
-        #ウェイト転送メソッドをSimpleWeightコピペに変更
-        weight.SimpleWeightCopyPaste().main(node, mode='copy', saveName=__name__, weightFile=node)
-        weight.SimpleWeightCopyPaste().main(dup, mode='paste', saveName=__name__, weightFile=node)
+        # ウェイト転送メソッドを WeightCopyPaste で実行
+        weight.WeightCopyPaste().main(node, mode='copy', saveName=__name__, weightFile=node)
+        weight.WeightCopyPaste().main(dup, mode='paste', saveName=__name__, weightFile=node)
         #親子付けを戻す
         common.TemporaryReparent().main(node,dummyParent=dummy, mode='parent')
         #ダミーペアレントを削除
@@ -182,16 +221,16 @@ def cehck_zero_poly_object(mesh=None, pop_msg=True):
         cmds.select(zeroPolyObj, r=True)
     return zeroPolyObj
     
-#スキニングを保ったままメッシュマージするクラス
+# スキニングを保ったままメッシュマージするクラス
 class MeshMarge():
     def main(self, objects):
-        self.objects= objects
-        qt.Callback(self.marge_run())
+        self.objects = objects
+        self.marged_mesh = []
+        qt.Callback(self.marge_run)()
         return self.marged_mesh
         
     def marge_run(self):
-        objects = common.search_polygon_mesh(self.objects, serchChildeNode=True, fullPath=True)
-        #print('marge target :', objects)
+        objects = common.search_polygon_mesh(self.objects, serchChildeNode=True, fullPath=True) or []
         if len(objects) < 2:
             self.marged_mesh = objects
             return True
@@ -243,7 +282,8 @@ class MeshMarge():
                         #print('lock attr :', lock, target_mesh, attr)
                         cmds.setAttr(target_mesh+attr, lock=lock)
                 break
-        target_mesh = cmds.rename(target_mesh, objects[0])
+        new_short_name = objects[0].split('|')[-1]
+        target_mesh = cmds.rename(target_mesh, new_short_name)
         cmds.select(target_mesh)
         self.marged_mesh = target_mesh
         return True

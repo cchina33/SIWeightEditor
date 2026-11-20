@@ -1,4 +1,21 @@
-# SIWeightEditor
+# SIWeightEditor Improve (Maya 2025+ 対応・拡張版フォーク)
+
+> [!NOTE]
+> 本リポジトリは [ShikouYamaue/SIWeightEditor](https://github.com/ShikouYamaue/SIWeightEditor) をベースに、**Maya 2025 以降（Python 3.11+ / PySide6・Qt6 / Viewport 2.0 / Maya 2022+ デフォーマ仕様）** での動作対応および機能拡張を行ったフォーク版（**SIWeightEditor Improve**）です。
+> パッケージ名・プラグイン名・メニュー項目を分離（`siweighteditor_improve` / `bake_skin_weight_improve.py`）しているため、オリジナル版と共存できます。
+
+### 主な改修・追加機能（Improve 版）
+- **Maya 2025+ / Python 3.12+ 互換性対応**：PySide6（Qt6）廃止 API・型チェック厳格化・Maya 2022+ `componentTags` 仕様などへの対応を実施。詳細は [MAYA2025_FIX_LIST.md](MAYA2025_FIX_LIST.md) を参照してください。
+- **Bone Vis（3D ビューポート透視表示）**：選択頂点に影響しているボーンを Viewport 2.0 上に X-Ray 表示し、接続ライン・ボーン名・ウェイト値・微小ウェイトを視覚化。
+- **Remap（ボーン付け替えウィンドウ）**：選択頂点のウェイトを別ボーンへリアルタイムに移動・追加（ターゲットボーンのビューポート強調表示対応）。
+- **Keep Bone**：別の頂点へ選択を切り替えても直前に選んでいたボーン列の選択状態を維持し、未バインドボーンのワンクリック追加にも対応。
+- **Joint Hilite / Used Joints 強化**：ヒートマップ／選択列モード切替、および `.drawStyle` を用いた使用ボーンのピンポイント表示（終了・保存時に元の表示を自動復元）。
+- **Model Edit（簡易モデリング修正・リグ整理ウィンドウ）**：JSON へのウェイト退避・解除・フリーズ・再バインド＆近傍補間復元、共有スケルトン一括復元、タイムラインのフレーム自動退避／復帰、ジョイント軸整理・メッシュクリーンアップを搭載。
+- **選択対応・安定性強化**：オブジェクトモード全体適用、エッジ／フェース選択時の OpenMaya API 2.0 対応、複数ウィンドウの背面潜り込み防止。
+
+---
+
+# SIWeightEditor（オリジナル README）
 
 SoftimageにあったWeightEditorをリスペクトして作成したMaya用SkinWeight編集プラグインです。  
 

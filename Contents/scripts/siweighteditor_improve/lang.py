@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 from maya import cmds
 
-UI_LANGUAGE = cmds.about(uil=True)
-
+UI_LANGUAGE = "ja_JP"
 
 class Lang(object):
     def __init__(self, en='', ja=''):

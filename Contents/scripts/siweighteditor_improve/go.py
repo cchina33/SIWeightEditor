@@ -39,18 +39,20 @@ def maya_import():
     if not os.path.exists(folderPath):
         os.makedirs(os.path.dirname(folderPath+os.sep))  # 末尾\\が必要なので注意
     #print(folderPath)
-    files = os.listdir(folderPath)
-    if files is not None:
+    files = [f for f in os.listdir(folderPath) if f.lower().endswith('.ma')]
+    if files:
         for file in files:
             print(file)
-            nameSpace = file.replace('.ma', '')
-            cmds.file(folderPath+os.sep+file, i=True, typ="mayaAscii", iv=True, mnc=False, options="v=0;", pr=True)
-            #重複マテリアルにファイル名が頭に付与されてしまうのを修正
-            allMat = cmds.ls(mat=True)
-            fileName = file.split('.')[0]
+            cmds.file(folderPath + os.sep + file, i=True, typ="mayaAscii", iv=True, mnc=False, options="v=0;", pr=True)
+            # 重複マテリアルにファイル名が頭に付与されてしまうのを修正
+            allMat = cmds.ls(mat=True) or []
+            fileName = os.path.splitext(file)[0]
             for mat in allMat:
-                if mat.startswith(fileName+'_'):
-                    cmds.rename(mat, mat.replace(fileName+'_', ''))
-        cmds.inViewMessage( amg='<hl>Go Maya</hl> : Imoprt objects', pos='midCenterTop', fade=True, ta=0.75, a=0.5)
+                if mat.startswith(fileName + '_'):
+                    try:
+                        cmds.rename(mat, mat.replace(fileName + '_', '', 1))
+                    except Exception:
+                        pass
+        cmds.inViewMessage(amg='<hl>Go Maya</hl> : Import objects', pos='midCenterTop', fade=True, ta=0.75, a=0.5)
     else:
-        cmds.inViewMessage( amg='<hl>Go Maya</hl> : There is no exported object', pos='midCenterTop', fade=True, ta=0.75, a=0.5)
+        cmds.inViewMessage(amg='<hl>Go Maya</hl> : There is no exported object', pos='midCenterTop', fade=True, ta=0.75, a=0.5)

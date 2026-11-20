@@ -167,8 +167,8 @@ class SubWindow(qt.SubWindow):
                 try:
                     with open(save_file, 'r') as f:
                         save_data = json.load(f)
-                        l_list = save_data.keys()
-                        r_list = save_data.values()
+                        l_list = list(save_data.keys())
+                        r_list = list(save_data.values())
                         self.all_lr_list.append([l_list, r_list])
                 except Exception as e:
                     print('{}'.format(e))

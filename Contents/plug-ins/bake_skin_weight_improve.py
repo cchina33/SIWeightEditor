@@ -4,14 +4,64 @@ from maya import cmds
 import maya.OpenMaya as om
 import maya.OpenMayaAnim as oma
 import maya.api.OpenMaya as om2
+import maya.api.OpenMayaRender as omr
 #import maya.api.OpenMayaUI as omui
  
-kPluginCmdName = "bakeSkinWeight" # MELコマンド名
+kPluginCmdName = "bakeSkinWeightImprove" # MELコマンド名
  
 kShortFlagName = "-ts"     # 引数のショートネーム
 kLongFlagName = "-test"   # 引数のロングネーム
  
 MAYA_VER = int(cmds.about(v=True)[:4])
+
+
+def _get_visible_mesh_shape_dag(node):
+    """メッシュノードから中間オブジェクト以外の可視シェイプ DAG を取得する。"""
+    try:
+        sel = om2.MSelectionList()
+        sel.add(node)
+        dag = sel.getDagPath(0)
+        if dag.node().hasFn(om2.MFn.kMesh):
+            return dag
+        shape_count = dag.numberOfShapesDirectlyBelow()
+        fallback = None
+        for idx in range(shape_count):
+            shape_dag = om2.MDagPath(dag)
+            try:
+                shape_dag.extendToShape(idx)
+            except Exception:
+                continue
+            if not shape_dag.node().hasFn(om2.MFn.kMesh):
+                continue
+            if fallback is None:
+                fallback = shape_dag
+            if not om2.MFnDagNode(shape_dag).isIntermediateObject:
+                return shape_dag
+        return fallback
+    except Exception:
+        return None
+
+
+def _notify_mesh_geometry_dirty(node, force_dg_sync=False):
+    """ウェイト書き込み後に Viewport 2.0 の描画・ピッキングキャッシュを同期させる。"""
+    shape_dag = _get_visible_mesh_shape_dag(node)
+    if shape_dag is None:
+        return
+    try:
+        omr.MRenderer.setGeometryDrawDirty(shape_dag.node())
+    except Exception:
+        pass
+    if force_dg_sync:
+        try:
+            om2.MFnMesh(shape_dag).updateSurface()
+        except Exception:
+            pass
+        try:
+            shape_path = shape_dag.fullPathName()
+            if cmds.objExists(shape_path):
+                cmds.dgdirty(shape_path)
+        except Exception:
+            pass
 
 def maya_useNewAPI():
     pass
@@ -23,7 +73,7 @@ class BakeSkinWeightClass( om2.MPxCommand ):
     
     def __init__(self):
         global siweighteditor
-        from siweighteditor import siweighteditor
+        from siweighteditor_improve import siweighteditor
         ''' Constructor. '''
         om2.MPxCommand.__init__(self)
     
@@ -53,9 +103,13 @@ class BakeSkinWeightClass( om2.MPxCommand ):
             skinFn = self.node_skinFn_dict[node]
             
             if MAYA_VER >= 2016:
-                sList = om2.MSelectionList()
-                sList.add(node)
-                meshDag, component = sList.getComponent(0)
+                meshDag = _get_visible_mesh_shape_dag(node)
+                if meshDag is None:
+                    sList = om2.MSelectionList()
+                    sList.add(node)
+                    meshDag, component = sList.getComponent(0)
+                if not vtxIndices:
+                    continue
                 # 指定の頂点をコンポーネントとして取得する
                 singleIdComp = om2.MFnSingleIndexedComponent()
                 vertexComp = singleIdComp.create(om2.MFn.kMeshVertComponent )
@@ -75,6 +129,7 @@ class BakeSkinWeightClass( om2.MPxCommand ):
             #print type(infIndices)
             #print type(vertexComp)
             skinFn.setWeights(meshDag, vertexComp , infIndices , weights, False)
+            _notify_mesh_geometry_dirty(node, force_dg_sync=not self.ignore_undo)
         #アンドゥ用ウェイトデータをアップデートする
         siweighteditor.update_dict(self.redo_node_weight_dict, self.bake_node_id_dict)
         if flash:
@@ -93,9 +148,13 @@ class BakeSkinWeightClass( om2.MPxCommand ):
             skinFn = self.node_skinFn_dict[node]
             
             if MAYA_VER >= 2016:
-                sList = om2.MSelectionList()
-                sList.add(node)
-                meshDag, component = sList.getComponent(0)
+                meshDag = _get_visible_mesh_shape_dag(node)
+                if meshDag is None:
+                    sList = om2.MSelectionList()
+                    sList.add(node)
+                    meshDag, component = sList.getComponent(0)
+                if not vtxIndices:
+                    continue
                 singleIdComp = om2.MFnSingleIndexedComponent()
                 vertexComp = singleIdComp.create(om2.MFn.kMeshVertComponent )
                 singleIdComp.addElements(vtxIndices)
@@ -111,6 +170,7 @@ class BakeSkinWeightClass( om2.MPxCommand ):
                         
             ##引数（dag_path, MIntArray, MIntArray, MDoubleArray, Normalize, old_weight_undo）
             skinFn.setWeights(meshDag, vertexComp , infIndices , weights, False)
+            _notify_mesh_geometry_dirty(node, force_dg_sync=True)
         #アンドゥの度に読み込むと重いからどうしよう。
         siweighteditor.refresh_window()
  

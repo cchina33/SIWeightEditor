@@ -82,9 +82,10 @@ def search_polygon_mesh(object, serchChildeNode=False, fullPath=False, mesh=True
     if serchChildeNode is True:
         parentNodes = object
         for node in parentNodes:
+            nodes = None
             try:
                 nodes = cmds.listRelatives(node, ad=True, c=True, typ='transform', fullPath=fullPath, s=False)
-            except:
+            except Exception:
                 pass
             if nodes is not None:
                 object = object + nodes

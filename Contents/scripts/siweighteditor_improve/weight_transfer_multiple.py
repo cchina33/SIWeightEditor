@@ -92,9 +92,9 @@ class WeightTransferMultiple(qt.SubWindow):
         ja=u'エラー！: メッシュかコンポーネントを選択してください').output()
         
     def stock_copy_mesh(self):
-        hl_node = cmds.ls(hl=True, l=True)
-        sel_node = cmds.ls(sl=True, l=True)
-        temp_copy_mesh = common.search_polygon_mesh(hl_node+sel_node, fullPath=True)
+        hl_node = cmds.ls(hl=True, l=True) or []
+        sel_node = cmds.ls(sl=True, l=True) or []
+        temp_copy_mesh = common.search_polygon_mesh(hl_node + sel_node, fullPath=True) or []
         self.copy_mesh = []
         for node in temp_copy_mesh:
             skin_cluster = cmds.ls(cmds.listHistory(node), type='skinCluster')
@@ -123,8 +123,8 @@ class WeightTransferMultiple(qt.SubWindow):
             return self.msg05
             
         self.transfer_mesh = cmds.filterExpand(sm=12) or []
-        self.transfer_comp = cmds.ls(sl=True, type='float3')
-        self.hl_nodes = cmds.ls(hl=True, l=True, tr=True)
+        self.transfer_comp = cmds.filterExpand(sm=(31, 32, 34)) or []
+        self.hl_nodes = cmds.ls(hl=True, l=True, tr=True) or []
         if self.transfer_comp:
             self.store_current_vtxArray()
             self.pre_transfer_for_noskin_comp()
@@ -164,31 +164,30 @@ class WeightTransferMultiple(qt.SubWindow):
                 cmds.bakePartialHistory(node, ppt=True)
                 reselection_flag = True
         if reselection_flag:
-            #print('reselect for undo :')
-            #アンドゥ、リドゥのためにエディタ側のスキン情報を更新しておく
+            # アンドゥ、リドゥのためにエディタ側のスキン情報を更新しておく
             cmds.select(self.transfer_comp, r=True)
-            siweighteditor.WINDOW.get_set_skin_weight()
+            if siweighteditor.WINDOW is not None:
+                siweighteditor.WINDOW.get_set_skin_weight()
                 
-    #インフルエンス合わせのために転送側の全てのインフルエンスを格納しておく
+    # インフルエンス合わせのために転送側の全てのインフルエンスを格納しておく
     all_influences = []
     def store_all_influence(self):
-        skin_cluster = cmds.ls(cmds.listHistory(self.marged_mesh), type='skinCluster')
+        skin_cluster = cmds.ls(cmds.listHistory(self.marged_mesh) or [], type='skinCluster') or []
         if not skin_cluster:
             return
         skin_cluster = skin_cluster[0]
-        self.all_influences = cmds.ls(cmds.skinCluster(skin_cluster, q=True, inf=True), l=True)
-        #print('get all influences', self.all_influences)
+        self.all_influences = cmds.ls(cmds.skinCluster(skin_cluster, q=True, inf=True) or [], l=True) or []
         
-    #足りないインフルエンスを追加しておく
+    # 足りないインフルエンスを追加しておく
     def adust_skin_influences(self, node):
-        skin_cluster = cmds.ls(cmds.listHistory(node), type='skinCluster')
+        skin_cluster = cmds.ls(cmds.listHistory(node) or [], type='skinCluster') or []
         if not skin_cluster:
             return
         skin_cluster = skin_cluster[0]
-        node_influences = cmds.ls(cmds.skinCluster(skin_cluster, q=True, inf=True), l=True)
+        node_influences = cmds.ls(cmds.skinCluster(skin_cluster, q=True, inf=True) or [], l=True) or []
         sub_influences = list(set(self.all_influences) - set(node_influences))
         if sub_influences:
-            cmds.skinCluster(node, e=True, ai=sub_influences, lw=True, ug=True, wt=0, ps=0)
+            cmds.skinCluster(skin_cluster, e=True, ai=sub_influences, lw=True, ug=True, wt=0, ps=0)
         
         
     def delete_sub_objects(self):
@@ -315,8 +314,8 @@ class WeightTransferMultiple(qt.SubWindow):
                                                     self.bake_node_inf_dict, self.node_skinFn_dict, 
                                                     self.undo_node_weight_dict, self.redo_node_weight_dict,
                                                     self.org_node_weight_dict)#最後はアンドゥようにオリジナル渡す
-        #焼きこみコマンド実行
-        cmds.bakeSkinWeight(rb=realbake, iu=ignoreundo)
+        # 焼き込みコマンド実行
+        cmds.bakeSkinWeightImprove(rb=realbake, iu=ignoreundo)
         
     def check_copy_mesh(self):
         for node in self.copy_mesh:

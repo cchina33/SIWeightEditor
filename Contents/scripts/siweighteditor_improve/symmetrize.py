@@ -123,10 +123,10 @@ def renameLR(rename):
         rename = 'RightRenameTemp_'+rename[2:]
     elif rename.startswith('R_')==True:
         rename = 'LeftRenameTemp_'+rename[2:]
-    if rename.endswith('_L')==True:
-        rename = rename[0:-2]+'_RightRenameTemp'
-    elif rename.startswith('_R')==True:
-        rename = rename[0:-2]+'_LeftRenameTemp'
+    if rename.endswith('_L') == True:
+        rename = rename[0:-2] + '_RightRenameTemp'
+    elif rename.endswith('_R') == True:
+        rename = rename[0:-2] + '_LeftRenameTemp'
     if '_L_' in rename:
         rename = rename.replace('_L_', '_RightRenameTemp_')
     if '_R_' in rename:
@@ -203,18 +203,21 @@ class WeightSymmetrize():
             #選択頂点を左右に振り分け
             self.vtx_L = self.listEachMesh(vertices, self.all_meshes, negaPosi = 1, plane=0)
             self.vtx_R = self.listEachMesh(vertices, self.all_meshes, negaPosi = -1, plane=0)
-            #メッシュの頂点をすべて取得
-            self.vtx_All = cmds.polyListComponentConversion(list(self.all_meshes), tv=True)
-            self.vtx_All = cmds.filterExpand(self.vtx_All, sm=31)
-            #全頂点を左右に振り分け
-            self.vtx_L_All= self.distributeVertex(self.vtx_All, negaPosi = 1, plane=0)
-            self.vtx_R_All = self.distributeVertex(self.vtx_All, negaPosi = -1, plane=0)
-            #左右それぞれにシムウェイト。左全部と右選択頂点を選択して実行、その反対を実行を順次処理。
-            #オブジェクト単位でミラーしないと1メッシュにしか適用されないっぽいので振り分けたメッシュ頂点リスト事にループ
+            # メッシュの頂点をすべて取得
+            self.vtx_All = cmds.polyListComponentConversion(list(self.all_meshes), tv=True) or []
+            self.vtx_All = cmds.filterExpand(self.vtx_All, sm=31) or []
+            if not self.vtx_All:
+                return
+            # 全頂点を左右に振り分け
+            self.vtx_L_All = self.distributeVertex(self.vtx_All, negaPosi=1, plane=0)
+            self.vtx_R_All = self.distributeVertex(self.vtx_All, negaPosi=-1, plane=0)
+            # 左右それぞれにシムウェイト。左全部と右選択頂点を選択して実行、その反対を実行を順次処理。
             for vtx_R in self.vtx_R:
-                self.ezSymWeight(target=self.vtx_L_All+vtx_R, mirror=False)#左から右へ転送
+                if self.vtx_L_All and vtx_R:
+                    self.ezSymWeight(target=self.vtx_L_All + vtx_R, mirror=False)  # 左から右へ転送
             for vtx_L in self.vtx_L:
-                self.ezSymWeight(target=self.vtx_R_All+vtx_L, mirror=True)#右から左へ転送
+                if self.vtx_R_All and vtx_L:
+                    self.ezSymWeight(target=self.vtx_R_All + vtx_L, mirror=True)  # 右から左へ転送
             
             #選択状態を元通りにする
             cmds.select(self.selection, r=True)

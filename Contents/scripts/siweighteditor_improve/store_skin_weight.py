@@ -168,19 +168,21 @@ class StoreSkinWeight():
             if "vtx" == cmpType:
                 vtxArray = om.MIntArray()
                 compFn.getElements(vtxArray)
-            #エッジを頂点IDに変換する
+            # エッジを頂点 ID に変換する
             elif "edge" == cmpType:
                 eid = om.MIntArray()
                 compFn.getElements(eid)
                 eSet = []
-                evid = mUtl.asInt2Ptr()#エッジ頂点を受け取るInt2を定義する
+                mUtl.createFromList([0, 0], 2)
+                evid = mUtl.asInt2Ptr()
                 for e in eid:
                     meshFn.getEdgeVertices(e, evid)
                     vid = [mUtl.getInt2ArrayItem(evid, 0, i) for i in range(2)]
                     eSet.extend(vid)
-                vids = list(set(eSet))
+                vids = sorted(set(eSet))
                 vtxArray = om.MIntArray()
-                [vtxArray.append(id) for id in vids]
+                for v_id in vids:
+                    vtxArray.append(v_id)
             #フェースを頂点IDに変換する
             elif "face" == cmpType:
                 fid = om.MIntArray()
@@ -319,9 +321,11 @@ class StoreSkinWeight():
         #全てのインフルエンスをまとめる
         self.all_influences = sorted(list(set(self.all_influences)))
     
-    #ウェイトをバーテックス単位の2次元配列にリシェイプする
+    # ウェイトをバーテックス単位の 2 次元配列にリシェイプする
     def conv_weight_shape(self, shape, weights):
-        return [[weights[i+j*shape] for i in range(shape)] for j in range(len(weights)/shape)]
+        if shape <= 0:
+            return []
+        return [[weights[i + j * shape] for i in range(shape)] for j in range(len(weights) // shape)]
         
     #名前からシェイプを逆引きして返す
     def om_get_shape(self, name):

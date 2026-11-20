@@ -6,11 +6,21 @@ import maya.utils
 from . import siweighteditor
 from . import qt
 
+def remove_menu():
+    """メインウィンドウメニューに登録した SiWeightEditor Improve 項目を削除する。"""
+    for item_name in ('siweighteditor_improve_open', 'siweighteditor_improve_folder', 'siweighteditor_improve_divider'):
+        try:
+            if cmds.menuItem(item_name, exists=True):
+                cmds.deleteUI(item_name, menuItem=True)
+        except Exception:
+            pass
+
+
 def menu_setup():
-    #Maya_Windowが見つからない場合はスタートしない
+    # Maya ウィンドウが見つからない場合は処理しない
     if not qt.get_maya_window():
         return
-        
+
     cmd = '''
     buildViewMenu MayaWindow|mainWindowMenu;
     setParent -menu "MayaWindow|mainWindowMenu";
@@ -18,24 +28,28 @@ def menu_setup():
 
     mel.eval(cmd)
 
-    cmds.menuItem(divider=True)
+    # 多重登録を防ぐため既存メニューがあれば先に削除する
+    remove_menu()
+
+    cmds.menuItem('siweighteditor_improve_divider', divider=True, parent='MayaWindow|mainWindowMenu')
     cmds.menuItem(
-        'siweighteditor_folder',
-        label='SiWeightEditor',
+        'siweighteditor_improve_folder',
+        label='SiWeightEditor Improve',
         subMenu=True,
-        tearOff=True
+        tearOff=True,
+        parent='MayaWindow|mainWindowMenu'
     )
 
     cmds.menuItem(
-        'siweighteditor_open',
-        label=jpn('SiWeightEditor'),
-        annotation="open SiWeightEditor",
-        parent='siweighteditor_folder',
+        'siweighteditor_improve_open',
+        label=jpn('SiWeightEditor Improve'),
+        annotation="open SiWeightEditor Improve",
+        parent='siweighteditor_improve_folder',
         echoCommand=True,
         command=dedent(
             '''
-                import siweighteditor.siweighteditor
-                siweighteditor.siweighteditor.Option()
+                import siweighteditor_improve.siweighteditor
+                siweighteditor_improve.siweighteditor.Option()
             ''')
     )
 
@@ -76,11 +90,11 @@ def register_runtime_command(opt):
 
 def register_siwieighteditor_runtime_command():
     opts = {
-        'annotation':      "Open SiWeightEditor",
-        'category':        "SiWeightEditor",
+        'annotation':      "Open SiWeightEditor Improve",
+        'category':        "SiWeightEditorImprove",
         'commandLanguage': "python",
-        'command':         r'''"from siweighteditor import siweighteditor\r\rreload(siweighteditor)\r\siweighteditor.Option() "''',
-        'cmd_name':        "OpenSiWeightEditor"
+        'command':         r'''"import importlib\rfrom siweighteditor_improve import siweighteditor\rimportlib.reload(siweighteditor)\rsiweighteditor.Option()"''',
+        'cmd_name':        "OpenSiWeightEditorImprove"
     }
     register_runtime_command(opts)
 

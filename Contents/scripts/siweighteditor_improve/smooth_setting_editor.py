@@ -66,10 +66,10 @@ class SubWindow(qt.SubWindow):
         self.tolerance_sld = QSlider(Qt.Horizontal)
         self.tolerance_sld.setRange(0, 10000)
         sub_layout.addWidget(self.tolerance_sld)
-        #コネクト
-        self.tolerance_sld.valueChanged[int].connect(lambda:self.tolerance.setValue(self.tolerance_sld.value()/10000.0))
-        self.tolerance.editingFinished.connect(lambda:self.tolerance_sld.setValue(self.tolerance.value()*10000))
-        self.tolerance_sld.setValue(self.loaded_data['weight_difference']*10000.0)
+        # コネクト（PySide6 の QSlider.setValue は整数のみ受け付けるため int へ変換）
+        self.tolerance_sld.valueChanged[int].connect(lambda: self.tolerance.setValue(self.tolerance_sld.value() / 10000.0))
+        self.tolerance.editingFinished.connect(lambda: self.tolerance_sld.setValue(int(round(self.tolerance.value() * 10000))))
+        self.tolerance_sld.setValue(int(round(self.loaded_data['weight_difference'] * 10000.0)))
         self.tolerance.valueChanged.connect(self.save_data)
         
         self.main_layout.addWidget(qt.make_h_line())

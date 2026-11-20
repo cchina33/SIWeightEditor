@@ -61,43 +61,53 @@ def main(mesh=None, pop_zero_poly=False):
         cmds.confirmDialog( title="Warning", message=msg )
         cmds.select(zero_mesh, r=True)
         
-#ブレンドシェイプ情報を保存
+# ブレンドシェイプ情報を保存
 def store_blend_shape(mesh):
-    shapes = cmds.listRelatives(mesh, s=True, f=True)
-    skin = cmds.ls(cmds.listHistory(shapes), type='skinCluster')
+    shapes = cmds.listRelatives(mesh, s=True, f=True) or []
+    if not shapes:
+        return {}
+    skin = cmds.ls(cmds.listHistory(shapes) or [], type='skinCluster') or []
     if skin:
-        connections = cmds.listConnections(skin, s=True, d=False)
+        connections = cmds.listConnections(skin, s=True, d=False) or []
     else:
-        connections = cmds.listConnections(shapes, s=True, d=False)
-    blend_shapes = cmds.ls(connections, l=True, type='blendShape')
+        connections = cmds.listConnections(shapes, s=True, d=False) or []
+    blend_shapes = cmds.ls(connections, l=True, type='blendShape') or [] if connections else []
     bs_dict = {}
     if blend_shapes:
         for bs in blend_shapes:
-            shape_target = cmds.ls(cmds.listConnections(bs, s=True, d=False), l=True, type='transform')
-            bs_dict[bs]=shape_target
+            bs_conns = cmds.listConnections(bs, s=True, d=False) or []
+            shape_target = cmds.ls(bs_conns, l=True, type='transform') or [] if bs_conns else []
+            if shape_target:
+                bs_dict[bs] = shape_target
         return bs_dict
-    return
+    return {}
     
 def set_blend_shape(mesh, bs_dict):
     if not bs_dict:
         return
     for bs, shape_target in bs_dict.items():
-        cmds.blendShape(shape_target+[mesh], name=bs, frontOfChain=True)
+        if not shape_target:
+            continue
+        cmds.blendShape(shape_target + [mesh], name=bs, frontOfChain=True)
     
 def repareDagSetMember(node):
-    #Dagセットメンバーの接続を修正する、シンメトリウェイトできないとき用。
+    # Dag セットメンバーの接続を修正する、シンメトリウェイトできないとき用。
     shadingEngin = get_shading_engines(node)
-    if shadingEngin == []:
+    if not shadingEngin:
         return
-    shapes = cmds.listRelatives(node, s=True, pa=True, type='mesh')
-    connections = cmds.listConnections(shapes[0], d=True, s=False, p=True, c=True)
-    for con in connections:
-        if shadingEngin[0]+'.dagSetMembers' in con:
+    shapes = cmds.listRelatives(node, s=True, pa=True, type='mesh') or []
+    if not shapes:
+        return
+    connections = cmds.listConnections(shapes[0], d=True, s=False, p=True, c=True) or []
+    conAttr = None
+    for idx in range(1, len(connections), 2):
+        con = connections[idx]
+        if shadingEngin[0] + '.dagSetMembers' in con:
             conAttr = con
-            listIndex = connections.index(con)
-            disconAttr = connections[listIndex-1]
+            disconAttr = connections[idx - 1]
             cmds.disconnectAttr(disconAttr, conAttr)
-    cmds.connectAttr(shapes[0]+'.instObjGroups[0]', conAttr, f=True)
+    if conAttr:
+        cmds.connectAttr(shapes[0] + '.instObjGroups[0]', conAttr, f=True)
     
 def copyWeight(node, engine='maya'):
     weight.WeightCopyPaste().main(node, mode='copy', saveName=__name__, engine=engine)
@@ -117,14 +127,24 @@ def freezeModeling(node, engine='maya'):
     #ダミーペアレントを削除
     common.TemporaryReparent().main(dummyParent=dummy, mode='delete')
         
-#接続の無い不要なシェイプを削除
+# 接続の無い不要なシェイプを削除（唯一の可視シェイプは誤削除しない）
 def deleteZeroShape(node):
-    meshnode = cmds.listRelatives(node, s=True, pa=True, type='mesh', fullPath=True)
+    meshnode = cmds.listRelatives(node, s=True, pa=True, type='mesh', fullPath=True) or []
+    if len(meshnode) <= 1:
+        return
+    visible_shapes = [
+        m for m in meshnode
+        if not cmds.getAttr(m + '.intermediateObject')
+    ]
     for mesh in meshnode:
-        triNum = cmds.polyEvaluate(mesh, triangle=True)
-        historyNode = cmds.listHistory(mesh, f=True)
+        is_intermediate = cmds.getAttr(mesh + '.intermediateObject')
+        historyNode = cmds.listHistory(mesh, f=True) or []
         if len(historyNode) <= 1:
+            if not is_intermediate and len(visible_shapes) <= 1:
+                continue
             cmds.delete(mesh)
+            if not is_intermediate and mesh in visible_shapes:
+                visible_shapes.remove(mesh)
         
 def save_cluster(node):
     #ノードの中からスキンクラスタを取得してくる#inMesh直上がSkinClusterとは限らないので修正
@@ -141,21 +161,24 @@ def save_cluster(node):
     
 def freeze():
     cmds.selectMode(o=True)
-    selection = cmds.ls(sl=True, type = 'transform')
-    dummy = common.TemporaryReparent().main(mode='create')#モジュールでダミーの親作成
+    selection = cmds.ls(sl=True, type='transform') or []
+    if not selection:
+        return
+    dummy = common.TemporaryReparent().main(mode='create')  # モジュールでダミーの親作成
     clusterCopy = modeling.ClusterCopy()
     for sel in selection:
-        allChildren = [sel] + cmds.listRelatives(sel, ad=True)#子供を取得して1つのリストにする
+        relatives = cmds.listRelatives(sel, ad=True, f=True) or []
+        allChildren = [sel] + relatives  # 子供を取得して一つのリストにする
         polyMesh = common.search_polygon_mesh(allChildren)
         if polyMesh:
             for mesh in polyMesh:
                 common.TemporaryReparent().main(mesh, dummyParent=dummy, mode='cut')
                 defCls = clusterCopy.copy(mesh)
-                cmds.bakePartialHistory(mesh,pc=True)
+                cmds.bakePartialHistory(mesh, pc=True)
                 if defCls:
                     clusterCopy.paste(mesh)
-                common.TemporaryReparent().main(mesh, dummyParent=dummy, mode='parent')#コピーのおわったメッシュの子供を元に戻す
-    common.TemporaryReparent().main(dummyParent=dummy, mode='delete')#ダミー親削除
+                common.TemporaryReparent().main(mesh, dummyParent=dummy, mode='parent')  # コピーの終わったメッシュの子供を元に戻す
+    common.TemporaryReparent().main(dummyParent=dummy, mode='delete')  # ダミー親削除
     cmds.select(selection, r=True)
     
 def get_shading_engines(root_node=None):

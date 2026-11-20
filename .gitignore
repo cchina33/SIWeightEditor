@@ -1,0 +1,15 @@
+# Python キャッシュ
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ローカル作業ドキュメント・ログ
+ai-task-docs/
+*.log
+
+# OS・エディタ一時ファイル
+.DS_Store
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/

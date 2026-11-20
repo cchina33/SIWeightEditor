@@ -57,7 +57,7 @@ class WeightCopyPaste():
             except Exception as e:
                 print('{}'.format(e))
                 return
-            self.filePath = self.protect_pat+os.sep + self.saveName
+            self.filePath = self.protect_path + os.sep + self.saveName
         self.fileName = os.path.join(self.filePath, self.saveName + '.json')
         self.apiName = os.path.join(self.filePath, self.saveName + '.skn')
         # コピーかペーストをそれぞれ呼び出し
@@ -116,19 +116,22 @@ class WeightCopyPaste():
                 dstSkinCluster = dstSkinCluster[0]
                 tempSkinNode = skinMesh#親を取得するためスキンクラスタのあるノードを保存しておく
             if self.engine == 'maya':
+                if not os.path.exists(self.filePath):
+                    print('Not exist saved weight folder : ' + str(self.filePath))
+                    continue
                 files = os.listdir(self.filePath)
-                print(files)
+                xml_name = ''
                 if len(files) == 2:
                     for file in files:
                         name, ext = os.path.splitext(file)
-                        if ext == '.xml':
+                        if ext.lower() == '.xml':
                             xml_name = file
-                else:
-                    # Pipeはファイル名に出来ないので変換しておく
+                            break
+                if not xml_name:
+                    # Pipe はファイル名に出来ないので変換しておく
                     meshName = str(weightFile).replace('|', '__pipe__')
                     # コロンはファイル名に出来ないので変換しておく
                     meshName = str(meshName).replace(':', '__colon__')
-                    
                     xml_name = meshName + '.xml'
                     
                 
@@ -178,15 +181,15 @@ class WeightCopyPaste():
             if not srcSkinCluster:
                 continue  # スキンクラスタがなかったら次に移行
             tempSkinNode = skinMesh#親を取得するためスキンクラスタのあるノードを保存しておく
-            # スキンクラスタのパラメータ色々を取得しておく
+            # スキンクラスタのパラメータを取得しておく
             srcSkinCluster = srcSkinCluster[0]
-            skinningMethod = cmds.getAttr(srcSkinCluster + ' .skm')
-            dropoffRate = cmds.getAttr(srcSkinCluster + ' .dr')
-            maintainMaxInfluences = cmds.getAttr(srcSkinCluster + ' .mmi')
-            maxInfluences = cmds.getAttr(srcSkinCluster + ' .mi')
-            bindMethod = cmds.getAttr(srcSkinCluster + ' .bm')
-            normalizeWeights = cmds.getAttr(srcSkinCluster + ' .nw')
-            influences = cmds.skinCluster(srcSkinCluster, q=True, inf=True)
+            skinningMethod = cmds.getAttr(srcSkinCluster + '.skm')
+            dropoffRate = cmds.getAttr(srcSkinCluster + '.dr')
+            maintainMaxInfluences = cmds.getAttr(srcSkinCluster + '.mmi')
+            maxInfluences = cmds.getAttr(srcSkinCluster + '.mi')
+            bindMethod = cmds.getAttr(srcSkinCluster + '.bm')
+            normalizeWeights = cmds.getAttr(srcSkinCluster + '.nw')
+            influences = cmds.skinCluster(srcSkinCluster, q=True, inf=True) or []
             saveData[';skinningMethod'] = skinningMethod
             saveData[';dropoffRate'] = dropoffRate
             saveData[';maintainMaxInfluences'] = maintainMaxInfluences
@@ -204,10 +207,10 @@ class WeightCopyPaste():
             if not srcSkinCluster:
                 continue  # スキンクラスタがなかったらfor分の次に移行
             srcSkinCluster = srcSkinCluster[0]
-            influences = cmds.skinCluster(srcSkinCluster, q=True, inf=True) 
+            influences = cmds.skinCluster(srcSkinCluster, q=True, inf=True) or []
             sub_influences = list(set(all_influences) - set(influences))
             if sub_influences:
-                cmds.skinCluster(skinMesh, e=True, ai=sub_influences, lw=True, ug=True, wt=0, ps=0)
+                cmds.skinCluster(srcSkinCluster, e=True, ai=sub_influences, lw=True, ug=True, wt=0, ps=0)
             if self.engine == 'maya':
                 # 読みに行くセーブファイル名を指定、autoならメッシュ名
                 if self.weightFile == 'auto':
@@ -257,15 +260,15 @@ def transfer_weight(skinMesh, transferedMesh, transferWeight=True, returnInfluen
         if logTransfer:
             print(skinMesh + massege01)
         return False  # スキンクラスタがなかったら関数抜ける
-    # スキンクラスタのパラメータ色々を取得しておく
+    # スキンクラスタのパラメータを取得しておく
     srcSkinCluster = srcSkinCluster[0]
-    skinningMethod = cmds.getAttr(srcSkinCluster + ' .skm')
-    dropoffRate = cmds.getAttr(srcSkinCluster + ' .dr')
-    maintainMaxInfluences = cmds.getAttr(srcSkinCluster + ' .mmi')
-    maxInfluences = cmds.getAttr(srcSkinCluster + ' .mi')
-    bindMethod = cmds.getAttr(srcSkinCluster + ' .bm')
-    normalizeWeights = cmds.getAttr(srcSkinCluster + ' .nw')
-    influences = cmds.skinCluster(srcSkinCluster, q=True, inf=True)  # qフラグは照会モード、ちなみにeは編集モード
+    skinningMethod = cmds.getAttr(srcSkinCluster + '.skm')
+    dropoffRate = cmds.getAttr(srcSkinCluster + '.dr')
+    maintainMaxInfluences = cmds.getAttr(srcSkinCluster + '.mmi')
+    maxInfluences = cmds.getAttr(srcSkinCluster + '.mi')
+    bindMethod = cmds.getAttr(srcSkinCluster + '.bm')
+    normalizeWeights = cmds.getAttr(srcSkinCluster + '.nw')
+    influences = cmds.skinCluster(srcSkinCluster, q=True, inf=True) or []  # q フラグは照会モード
 
     # リストタイプじゃなかったらリストに変換する
     if not isinstance(transferedMesh, list):
@@ -343,8 +346,9 @@ def symmetry_weight(srcNode=None, dstNode=None, symWeight=True):
             if symWeight is False or dstNode is None:
                 return
             transfer_weight(srcNode, dstNode, transferWeight=False, returnInfluences=True)
-            dstShapes = cmds.listRelatives(dstNode, s=True, pa=True, type='mesh')
-            dstSkinCluster = cmds.listConnections(dstShapes[0] + '.inMesh', s=True, d=False)
+            dstSkinCluster = cmds.ls(cmds.listHistory(dstNode) or [], type='skinCluster') or []
+            if not dstSkinCluster:
+                return
             cmds.copySkinWeights(ss=srcSkinCluster[0], ds=dstSkinCluster[0],
                                  mirrorMode='YZ', surfaceAssociation='closestComponent',
                                  influenceAssociation='label', normalize=True)
@@ -375,8 +379,8 @@ def load_joint_label_rules():
             try:
                 with open(save_file, 'r') as f:
                     save_data = json.load(f)
-                    l_list = save_data.keys()
-                    r_list = save_data.values()
+                    l_list = list(save_data.keys())
+                    r_list = list(save_data.values())
                     left_list_list.append(l_list)
                     right_list_list.append(r_list)
             except Exception as e:
@@ -459,15 +463,14 @@ def toggle_mute_skinning():
         ja=u'スキニングが有効になりました') .output()
     
     cmds.selectMode(o=True)
-    objects = cmds.ls(sl=True, l=True)
+    objects = cmds.ls(sl=True, l=True) or []
     ad_node = []
     
     for node in objects:
-        children = cmds.ls(cmds.listRelatives(node, ad=True, f=True), type ='transform')
-        ad_node += [node]+children
-    #print(len(ad_node))
+        relatives = cmds.listRelatives(node, ad=True, f=True) or []
+        children = cmds.ls(relatives, type='transform', l=True) or [] if relatives else []
+        ad_node += [node] + children
     objects = set(ad_node)
-    #print(len(objects))
     
     if not objects:
         all_mesh = cmds.confirmDialog(m=msg01, t='', b= [msg02, msg03], db=msg02, cb=msg03, icn='question',ds=msg03)
