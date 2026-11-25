@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import contextlib
+import ctypes
 import sys
 from maya import OpenMayaUI, cmds
 from maya.app.general.mayaMixin import MayaQWidgetDockableMixin
@@ -39,37 +41,143 @@ def get_maya_window():
         if sys.version_info[0] == 3:
             return shiboken.wrapInstance(int(OpenMayaUI.MQtUtil.mainWindow()), QWidget)
         return shiboken.wrapInstance(long(OpenMayaUI.MQtUtil.mainWindow()), QWidget)
-    except:
+    except Exception:
         return None
-            
+
+
+def attach_maya_window_owner(widget):
+    """非ドッキングウィンドウが Maya 本体より後ろへ回らないよう OS / Qt レベルでオーナー関係を設定する。"""
+    if widget is None:
+        return False
+    maya_win = get_maya_window()
+    if maya_win is None or widget is maya_win:
+        return False
+    try:
+        if hasattr(widget, "isDockable") and widget.isDockable():
+            return False
+    except Exception:
+        pass
+
+    attached = False
+    try:
+        w_handle = widget.windowHandle()
+        m_handle = maya_win.windowHandle()
+        if w_handle is not None and m_handle is not None:
+            if w_handle.transientParent() is not m_handle:
+                w_handle.setTransientParent(m_handle)
+            attached = True
+    except Exception:
+        pass
+
+    # Windows 環境では Win32 のオーナー HWND（GWLP_HWNDPARENT）も合わせて保証する
+    if sys.platform.startswith("win"):
+        try:
+            w_hwnd = int(widget.winId())
+            m_hwnd = int(maya_win.winId())
+            if w_hwnd and m_hwnd and w_hwnd != m_hwnd:
+                user32 = ctypes.windll.user32
+                is_64bit = sys.maxsize > 2**32
+                get_fn = user32.GetWindowLongPtrW if is_64bit else user32.GetWindowLongW
+                set_fn = user32.SetWindowLongPtrW if is_64bit else user32.SetWindowLongW
+                get_fn.argtypes = [ctypes.c_void_p, ctypes.c_int]
+                get_fn.restype = ctypes.c_void_p
+                set_fn.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+                set_fn.restype = ctypes.c_void_p
+                gwlp_hwndparent = -8
+                cur_owner = get_fn(ctypes.c_void_p(w_hwnd), gwlp_hwndparent)
+                if cur_owner != m_hwnd:
+                    set_fn(ctypes.c_void_p(w_hwnd), gwlp_hwndparent, ctypes.c_void_p(m_hwnd))
+                attached = True
+        except Exception:
+            pass
+    return attached
+
+
 class MainWindow(QMainWindow):
-    def __init__(self, parent = MAYA_WIDNOW):
-        super(MainWindow, self).__init__(MAYA_WIDNOW)
-       
+    def __init__(self, parent=None):
+        if parent is None:
+            parent = get_maya_window()
+        super(MainWindow, self).__init__(parent)
+        self.setWindowFlag(Qt.Window, True)
+
+    def showEvent(self, event):
+        super(MainWindow, self).showEvent(event)
+        attach_maya_window_owner(self)
+
+
 class SubWindow(QMainWindow):
-    def __init__(self, parent = MAYA_WIDNOW):
-        super(SubWindow, self).__init__(MAYA_WIDNOW)
-        
+    def __init__(self, parent=None):
+        if parent is None:
+            parent = get_maya_window()
+        super(SubWindow, self).__init__(parent)
+        self.setWindowFlag(Qt.Window, True)
+
+    def showEvent(self, event):
+        super(SubWindow, self).showEvent(event)
+        attach_maya_window_owner(self)
+
+
 class DockWindow(MayaQWidgetDockableMixin, QMainWindow):
     def __init__(self, *args, **kwargs):
+        if not args and "parent" not in kwargs:
+            kwargs["parent"] = get_maya_window()
+        elif args and args[0] is None:
+            args = (get_maya_window(),) + tuple(args[1:])
+        elif kwargs.get("parent") is None and "parent" in kwargs:
+            kwargs["parent"] = get_maya_window()
         super(DockWindow, self).__init__(*args, **kwargs)
+
+    def showEvent(self, event):
+        super(DockWindow, self).showEvent(event)
+        attach_maya_window_owner(self)
     
+@contextlib.contextmanager
+def undo_chunk(chunk_name=None):
+    """Maya の Undo チャンクを安全に開閉するコンテキストマネージャ。"""
+    if chunk_name:
+        cmds.undoInfo(openChunk=True, chunkName=chunk_name)
+    else:
+        cmds.undoInfo(openChunk=True)
+    try:
+        yield
+    finally:
+        cmds.undoInfo(closeChunk=True)
+
+
+@contextlib.contextmanager
+def suspend_undo():
+    """元の stateWithoutFlush を退避・復元しながら Undo 記録を一時停止する。"""
+    prev_state = True
+    try:
+        prev_state = bool(cmds.undoInfo(query=True, stateWithoutFlush=True))
+    except Exception:
+        prev_state = True
+    cmds.undoInfo(stateWithoutFlush=False)
+    try:
+        yield
+    finally:
+        try:
+            cmds.undoInfo(stateWithoutFlush=prev_state)
+        except Exception:
+            pass
+
+
 class Callback(object):
+    """Qt シグナルから Maya 操作を単一の Undo チャンクで実行するラッパー。"""
+
     def __init__(self, func, *args, **kwargs):
         self.__func = func
         self.__args = args
         self.__kwargs = kwargs
-    
+        func_name = getattr(func, "__name__", "")
+        if func_name and func_name != "<lambda>":
+            self.__chunk_name = "SIWE_" + func_name
+        else:
+            self.__chunk_name = "SIWE_Action"
+
     def __call__(self, *args, **kwargs):
-        cmds.undoInfo(openChunk=True)
-        try:
+        with undo_chunk(self.__chunk_name):
             return self.__func(*self.__args, **self.__kwargs)
-            
-        except:
-            raise
-            
-        finally:
-            cmds.undoInfo(closeChunk=True)
             
 #右クリックボタンクラスの作成
 class RightClickButton(QPushButton):

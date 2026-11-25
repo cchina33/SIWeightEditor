@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""スキニング済みメッシュ＆ボーンの修正（記録→解除→編集→再バインド＆補間復元）、ジョイント整理・Joint Orient、メッシュ＆シーンクリーンアップ専用ウィンドウ。"""
+"""スキニング済みメッシュ＆ボーンの修正（記録→解除→修正→再バインド＆補間復元）、ジョイント整理・Joint Orient、メッシュ＆シーンクリーンアップ専用ウィンドウ。"""
 
 import datetime as dt
 import json
@@ -21,13 +21,30 @@ except ImportError:
 from .. import common
 from .. import lang
 from .. import qt
+from . import reference_joint_helper
 from . import rig_cleanup_helper
+from . import unweighted_bind_window
+from . import weight_mirror_copy_helper
 _reload(rig_cleanup_helper)
+_reload(reference_joint_helper)
+_reload(unweighted_bind_window)
+_reload(weight_mirror_copy_helper)
 from ..qt import *
 
 
 WEIGHT_EPSILON = 1e-6
 DATA_DIR_NAME = "siweighteditor_improve_model_edit"
+LAST_JOINT_CACHE_FILENAME = "_last_joint_cache.json"
+
+# 各タブの表示・非表示設定（True: 表示 / False: 非表示）
+TAB_VISIBILITY = {
+    "model_bone": True,      # モデル / ボーン修正
+    "bind_mirror": True,     # バインド / ミラー＆コピー
+    "joint_orient": True,    # ジョイント整理 / Orient
+    "joint_inspect": False,  # ジョイント診断 / 調整
+    "ref_joint": False,      # リファレンス軸上書き
+    "cleanup": True,         # メッシュ / シーンクリーンアップ
+}
 
 
 def _get_storage_dir():
@@ -37,6 +54,113 @@ def _get_storage_dir():
     if not os.path.exists(path):
         os.makedirs(path)
     return path
+
+
+def _get_last_joint_cache_path():
+    """修正開始時の記憶ジョイントを一時保存するキャッシュ JSON パスを返す。"""
+    return os.path.join(_get_storage_dir(), LAST_JOINT_CACHE_FILENAME)
+
+
+def _save_last_seed_joints(joint_paths):
+    """使用したジョイント名一覧を一時キャッシュ JSON へ保存する。"""
+    unique_joints = []
+    seen = set()
+    for jnt in (joint_paths or []):
+        if jnt and jnt not in seen:
+            seen.add(jnt)
+            unique_joints.append(jnt)
+    if not unique_joints:
+        return []
+    payload = {
+        "saved_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "joints": unique_joints,
+    }
+    try:
+        with open(_get_last_joint_cache_path(), "w") as fp:
+            json.dump(payload, fp)
+    except Exception:
+        pass
+    return unique_joints
+
+
+def _load_last_seed_joints():
+    """一時キャッシュ JSON から記憶済みのジョイント名一覧を読み込む。"""
+    cache_path = _get_last_joint_cache_path()
+    if not os.path.exists(cache_path):
+        return []
+    try:
+        with open(cache_path, "r") as fp:
+            data = json.load(fp)
+        joints = data.get("joints") or []
+        return [j for j in joints if isinstance(j, str) and j]
+    except Exception:
+        return []
+
+
+def _clear_last_seed_joints():
+    """記憶済みジョイントの一時キャッシュを削除する。"""
+    cache_path = _get_last_joint_cache_path()
+    try:
+        if os.path.exists(cache_path):
+            os.remove(cache_path)
+    except Exception:
+        pass
+
+
+def _resolve_cached_joints(cached_joints):
+    """記憶済みジョイント一覧を現在シーンに存在するジョイントフルパス一覧へ解決する。"""
+    resolved = []
+    seen = set()
+    for jnt in (cached_joints or []):
+        if cmds.objExists(jnt):
+            found = cmds.ls(jnt, type="joint", long=True) or []
+            for item in found:
+                if item not in seen:
+                    seen.add(item)
+                    resolved.append(item)
+            continue
+        short_name = jnt.split("|")[-1]
+        found = cmds.ls(short_name, type="joint", long=True) or []
+        if found and found[0] not in seen:
+            seen.add(found[0])
+            resolved.append(found[0])
+    return resolved
+
+
+def _is_hips_named_joint(joint_path):
+    """ジョイント名（ネームスペース除外）が '[キャラ名]_Hips' 形式かどうかを判定する。"""
+    if not joint_path:
+        return False
+    short_name = str(joint_path).split("|")[-1]
+    base_name = short_name.split(":")[-1]
+    return bool(re.match(r"^.+_Hips$", base_name, re.IGNORECASE))
+
+
+def _find_hips_joint_in_skeleton(seed_joints):
+    """指定ジョイント群と同一スケルトン内に存在する '[キャラ名]_Hips' ジョイントを探索して返す。"""
+    roots = []
+    seen_roots = set()
+    for jnt in (seed_joints or []):
+        if not jnt or not cmds.objExists(jnt):
+            continue
+        cur = jnt
+        while True:
+            parents = cmds.listRelatives(cur, parent=True, type="joint", fullPath=True) or []
+            if not parents:
+                break
+            cur = parents[0]
+        if cur not in seen_roots:
+            seen_roots.add(cur)
+            roots.append(cur)
+
+    for root in roots:
+        if _is_hips_named_joint(root):
+            return root
+        desc = cmds.listRelatives(root, allDescendents=True, type="joint", fullPath=True) or []
+        for child in desc:
+            if _is_hips_named_joint(child):
+                return child
+    return None
 
 
 def _make_safe_filename(mesh_name):
@@ -298,7 +422,7 @@ def _resolve_existing_influences(saved_influences):
 
 
 def _detach_and_freeze_for_modeling(mesh_long):
-    """バインド解除・ヒストリ削除・安全フリーズを実行して編集可能状態にする。"""
+    """バインド解除・ヒストリ削除・安全フリーズを実行して修正可能状態にする。"""
     dummy = common.TemporaryReparent().main(mode="create")
     try:
         common.TemporaryReparent().main(mesh_long, dummyParent=dummy, mode="cut")
@@ -528,7 +652,9 @@ def finish_modeling_and_restore(
             for inf_idx, w_val in w_dict.items():
                 flat_weights[base + inf_idx] = w_val
 
-    skin_fn.setWeights(shape_dag, vtx_comp, inf_indices, flat_weights, False)
+    rig_cleanup_helper._set_weights_without_norm_warning(
+        skin_fn, shape_dag, vtx_comp, inf_indices, flat_weights
+    )
 
     # 新規・移動頂点への任意スムース適用（トポロジ変更時のみ）
     if smooth_iters > 0 and changed_vids:
@@ -575,7 +701,12 @@ class ModelEditLogWindow(qt.SubWindow):
     def __init__(self, owner_window):
         super(ModelEditLogWindow, self).__init__(parent=qt.get_maya_window())
         self.owner = owner_window
-        self.setWindowTitle(self.WINDOW_TITLE)
+        self.setWindowTitle(
+            lang.Lang(
+                en="Model Edit Log - SIWeightEditor Improve",
+                ja=u"モデル修正ログ - SIWeightEditor Improve",
+            ).output()
+        )
         self.setObjectName(self.WINDOW_OBJECT_NAME)
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.resize(620, 380)
@@ -638,18 +769,37 @@ class ModelEditWindow(qt.SubWindow):
     def __init__(self, editor_window):
         super(ModelEditWindow, self).__init__(parent=qt.get_maya_window())
         self.editor = editor_window
-        self.setWindowTitle(self.WINDOW_TITLE)
+        self.setWindowTitle(
+            lang.Lang(
+                en="Model & Bone Edit / Cleanup - SIWeightEditor Improve",
+                ja=u"モデル＆ボーン修正 / クリーンアップ - SIWeightEditor Improve",
+            ).output()
+        )
         self.setObjectName(self.WINDOW_OBJECT_NAME)
         self.setAttribute(Qt.WA_DeleteOnClose)
-        self.resize(650, 620)
+        self.resize(650, 645)
 
         self._records = []
         self._joint_issues = []
         self._log_entries = []
         self._saved_frame = None
+        self._cached_joints = _load_last_seed_joints()
+        self._ref_cur_records = []
+        self._ref_cur_meshes = []
+        self._ref_source_records = []
+        self._ref_mapping_data = None
+        self._quick_axis_ref = None
+        self._weight_copy_src_mesh = None
+        self._radius_syncing = False
+        self._radius_undo_open = False
+        self._radius_script_job_id = None
         self.log_window = None
+        self.unweighted_bind_window = None
         self._init_ui()
+        self._update_cached_joint_ui()
         self.reload_record_list()
+        self._install_radius_selection_job()
+        self._sync_radius_from_selection()
 
     def _init_ui(self):
         central = QWidget(self)
@@ -659,18 +809,48 @@ class ModelEditWindow(qt.SubWindow):
         main_layout.setSpacing(6)
 
         self.tabs = QTabWidget(self)
-        self.tabs.addTab(
-            self._build_model_bone_tab(),
-            lang.Lang(en="Model / Bone Edit", ja=u"モデル / ボーン修正").output(),
-        )
-        self.tabs.addTab(
-            self._build_joint_orient_tab(),
-            lang.Lang(en="Joint Cleanup / Orient", ja=u"ジョイント整理 / Orient").output(),
-        )
-        self.tabs.addTab(
-            self._build_cleanup_tab(),
-            lang.Lang(en="Mesh / Scene Cleanup", ja=u"メッシュ / シーンクリーンアップ").output(),
-        )
+        self._tab_order = []
+        self._tab_entries = {}
+        self._tab_visibility = dict(TAB_VISIBILITY)
+
+        tab_defs = [
+            (
+                "model_bone",
+                self._build_model_bone_tab(),
+                lang.Lang(en="Model / Bone Edit", ja=u"モデル / ボーン修正").output(),
+            ),
+            (
+                "bind_mirror",
+                self._build_bind_mirror_tab(),
+                lang.Lang(en="Bind / Mirror & Copy", ja=u"バインド / ミラー＆コピー").output(),
+            ),
+            (
+                "joint_orient",
+                self._build_joint_orient_tab(),
+                lang.Lang(en="Joint Cleanup / Orient", ja=u"ジョイント整理 / Orient").output(),
+            ),
+            (
+                "joint_inspect",
+                self._build_joint_inspect_tab(),
+                lang.Lang(en="Joint Inspect / Adjust", ja=u"ジョイント診断 / 調整").output(),
+            ),
+            (
+                "ref_joint",
+                self._build_reference_joint_tab(),
+                lang.Lang(en="Ref Joint Overwrite", ja=u"リファレンス軸上書き").output(),
+            ),
+            (
+                "cleanup",
+                self._build_cleanup_tab(),
+                lang.Lang(en="Mesh / Scene Cleanup", ja=u"メッシュ / シーンクリーンアップ").output(),
+            ),
+        ]
+        for tab_key, widget, label in tab_defs:
+            self._tab_order.append(tab_key)
+            self._tab_entries[tab_key] = {"widget": widget, "label": label}
+            self.tabs.addTab(widget, label)
+
+        self.apply_tab_visibility(self._tab_visibility)
         main_layout.addWidget(self.tabs, 1)
 
         # 全タブ共通の 1 行ステータス欄と詳細ログウィンドウボタン
@@ -705,7 +885,7 @@ class ModelEditWindow(qt.SubWindow):
         guide_label = QLabel(
             lang.Lang(
                 en="Safely edit skinned meshes (verts/edges) AND bone positions while preserving weights via JSON.",
-                ja=u"メッシュ（頂点移動・エッジ追加/削除）だけでなくボーン位置の変更にも対応します。\nJSON へ記録・解除してから自由にモデルやジョイントを編集し、完了後に新ボーン位置で再バインド＆ウェイト復元を行います。",
+                ja=u"メッシュ（頂点移動・エッジ追加/削除）だけでなくボーン位置の変更にも対応します。\nJSON へ記録・解除してから自由にモデルやジョイントを修正し、完了後に新ボーン位置で再バインド＆ウェイト復元を行います。",
             ).output()
         )
         guide_label.setWordWrap(True)
@@ -713,11 +893,11 @@ class ModelEditWindow(qt.SubWindow):
         guide_label.setMargin(6)
         layout.addWidget(guide_label)
 
-        # ステップ：編集開始
+        # ステップ：修正開始
         step1_box = QGroupBox(
             lang.Lang(
                 en="Step 1 : Start Editing (Record JSON -> Freeze & Unbind)",
-                ja=u"ステップ 1：編集開始（JSON 記録 → フリーズ・ヒストリ削除・バインド解除）",
+                ja=u"ステップ 1：修正開始（JSON 記録 → フリーズ・ヒストリ削除・バインド解除）",
             ).output()
         )
         step1_layout = QVBoxLayout(step1_box)
@@ -730,7 +910,7 @@ class ModelEditWindow(qt.SubWindow):
         self.restore_frame_chk = QCheckBox(
             lang.Lang(
                 en="Jump to edit frame on start & restore original frame after finish:",
-                ja=u"編集開始時に指定フレームへ移動し、完了後に元のフレームへ戻す:",
+                ja=u"修正開始時に指定フレームへ移動し、完了後に元のフレームへ戻す:",
             ).output()
         )
         self.restore_frame_chk.setChecked(True)
@@ -743,7 +923,7 @@ class ModelEditWindow(qt.SubWindow):
         self.edit_frame_spin.setToolTip(
             lang.Lang(
                 en="Frame used while editing mesh/bones (default: 0)",
-                ja=u"モデリング・ボーン編集時に移動する基準フレーム（デフォルト: 0）",
+                ja=u"モデリング・ボーン修正時に移動する基準フレーム（デフォルト: 0）",
             ).output()
         )
         self.restore_frame_chk.toggled.connect(self.edit_frame_spin.setEnabled)
@@ -770,10 +950,36 @@ class ModelEditWindow(qt.SubWindow):
         self.include_shared_meshes_chk.setChecked(True)
         step1_layout.addWidget(self.include_shared_meshes_chk)
 
+        # 記憶済みジョイント表示行（2 回目以降は未選択でも修正開始可能）
+        cached_row = QHBoxLayout()
+        cached_row.setContentsMargins(0, 0, 0, 0)
+        cached_row.setSpacing(6)
+
+        self.cached_joint_label = QLabel("")
+        self.cached_joint_label.setWordWrap(False)
+        self.cached_joint_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.cached_joint_label.setFixedHeight(22)
+        qt.change_button_color(self.cached_joint_label, textColor=[180, 215, 245], bgColor=[44, 48, 56])
+        self.cached_joint_label.setMargin(3)
+        cached_row.addWidget(self.cached_joint_label, 1)
+
+        self.clear_cached_joint_but = QPushButton(lang.Lang(en="Clear", ja=u"クリア").output())
+        self.clear_cached_joint_but.setFixedHeight(22)
+        self.clear_cached_joint_but.setMaximumWidth(64)
+        self.clear_cached_joint_but.setToolTip(
+            lang.Lang(
+                en="Clear temporarily saved joint memory",
+                ja=u"一時保存しているジョイント記憶をクリアします",
+            ).output()
+        )
+        self.clear_cached_joint_but.clicked.connect(self.clear_cached_joint_memory)
+        cached_row.addWidget(self.clear_cached_joint_but, 0)
+        step1_layout.addLayout(cached_row)
+
         self.start_edit_but = QPushButton(
             lang.Lang(
-                en="Record Weights & Start Editing (Selected Mesh or Joint)",
-                ja=u"選択メッシュ / ジョイントのウェイトを記録して編集開始",
+                en="Record Weights & Start Editing (Selected Mesh / Joint, or Saved Joint)",
+                ja=u"選択メッシュ / ジョイント（または記憶ジョイント）で修正開始",
             ).output()
         )
         self.start_edit_but.setMinimumHeight(30)
@@ -839,11 +1045,11 @@ class ModelEditWindow(qt.SubWindow):
 
         layout.addWidget(list_box, 1)
 
-        # ステップ：編集完了
+        # ステップ：修正完了
         step2_box = QGroupBox(
             lang.Lang(
                 en="Step 2 : Finish Editing (Clean bindPose -> Freeze -> Rebind -> Restore)",
-                ja=u"ステップ 2：編集完了（古い bindPose 整理 → フリーズ → 再バインド → ウェイト復元）",
+                ja=u"ステップ 2：修正完了（古い bindPose 整理 → フリーズ → 再バインド → ウェイト復元）",
             ).output()
         )
         step2_layout = QVBoxLayout(step2_box)
@@ -892,7 +1098,7 @@ class ModelEditWindow(qt.SubWindow):
         self.finish_edit_but = QPushButton(
             lang.Lang(
                 en="Finish & Restore All Recorded Meshes",
-                ja=u"編集完了（全メッシュを再バインド＆復元）",
+                ja=u"修正完了（全メッシュを再バインド＆復元）",
             ).output()
         )
         self.finish_edit_but.setMinimumHeight(30)
@@ -911,13 +1117,378 @@ class ModelEditWindow(qt.SubWindow):
         return tab
 
     # ------------------------------------------------------------------
+    # タブ構築：バインド / 高精度ウェイトミラー＆コピー
+    # ------------------------------------------------------------------
+    def _build_bind_mirror_tab(self):
+        outer = QWidget(self)
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        scroll.setWidget(tab)
+        outer_layout.addWidget(scroll)
+
+        # ボーンの安全バインド（既存ウェイト維持）
+        bind_box = QGroupBox(
+            lang.Lang(
+                en="Safe Bind Skin for Selected Joints (Preserves Existing Weights)",
+                ja=u"ボーンの安全バインド（既存ウェイトを維持して選択ジョイント・子をバインド）",
+            ).output()
+        )
+        bind_layout = QVBoxLayout(bind_box)
+        bind_layout.setContentsMargins(8, 6, 8, 6)
+        bind_layout.setSpacing(5)
+
+        bind_mode_row = QHBoxLayout()
+        bind_mode_row.setSpacing(6)
+        bind_mode_row.addWidget(
+            QLabel(lang.Lang(en="Weight Mode:", ja=u"ウェイト割当:").output())
+        )
+        self.safe_bind_mode_combo = QComboBox(self)
+        self.safe_bind_mode_combo.addItem(
+            lang.Lang(
+                en="Mirror from Opposite Bone (e.g. Left -> Right, keeps existing)",
+                ja=u"反対側ボーンからミラー転写（例: Left → Right・既存ウェイト保護）",
+            ).output(),
+            "mirror_opposite",
+        )
+        self.safe_bind_mode_combo.addItem(
+            lang.Lang(
+                en="Auto-Bind Nearby Vertices (blends new bone, keeps existing)",
+                ja=u"近傍の自動バインドで初期ウェイト割当（既存ウェイト保護）",
+            ).output(),
+            "auto_bind_new",
+        )
+        self.safe_bind_mode_combo.addItem(
+            lang.Lang(
+                en="Add Influence Only (weight = 0.0, untouched existing)",
+                ja=u"インフルエンス追加のみ（ウェイト 0・既存ウェイト維持）",
+            ).output(),
+            "add_zero_only",
+        )
+        self.safe_bind_mode_combo.setToolTip(
+            lang.Lang(
+                en="Select target joint(s) only (auto-detects shared skinned mesh) or select joints + mesh together.\nExisting weights on other bones/sides remain untouched.",
+                ja=u"ジョイントだけ選択すれば同一スケルトンのスキニング済みメッシュを自動検出します（メッシュ同時選択も可）。\n他のボーンや反対側の既存ウェイトを壊さずに安全にバインドします。",
+            ).output()
+        )
+        bind_mode_row.addWidget(self.safe_bind_mode_combo, 1)
+        bind_layout.addLayout(bind_mode_row)
+
+        bind_opt_row = QHBoxLayout()
+        bind_opt_row.setSpacing(10)
+        self.safe_bind_children_chk = QCheckBox(
+            lang.Lang(en="Include child joints", ja=u"選択ジョイントの子階層も含める").output()
+        )
+        self.safe_bind_children_chk.setChecked(True)
+        bind_opt_row.addWidget(self.safe_bind_children_chk)
+
+        self.safe_bind_unlock_chk = QCheckBox(
+            lang.Lang(
+                en="Unlock added influences (ready to adjust)",
+                ja=u"追加後にインフルエンスロックを解除",
+            ).output()
+        )
+        self.safe_bind_unlock_chk.setChecked(True)
+        bind_opt_row.addWidget(self.safe_bind_unlock_chk)
+        bind_opt_row.addStretch(1)
+        bind_layout.addLayout(bind_opt_row)
+
+        bind_btn_row = QHBoxLayout()
+        bind_btn_row.setSpacing(6)
+        self.exec_safe_bind_but = QPushButton(
+            lang.Lang(
+                en="Safe Bind Selected Joint(s) to Skin (Keep Existing Weights)",
+                ja=u"選択ジョイントを安全にバインド（既存ウェイト維持）",
+            ).output()
+        )
+        self.exec_safe_bind_but.setMinimumHeight(28)
+        self.exec_safe_bind_but.setToolTip(
+            lang.Lang(
+                en="Run at bind pose (frame 0) for cleanest deformation. Supports 1-click Undo (Ctrl+Z).",
+                ja=u"バインドポーズ（基準フレーム）での実行を推奨します。Ctrl+Z 1 回で元に戻せます。",
+            ).output()
+        )
+        self.exec_safe_bind_but.clicked.connect(self.run_safe_bind_selected_joints)
+        bind_btn_row.addWidget(self.exec_safe_bind_but, 2)
+
+        self.open_unweighted_bind_but = QPushButton(
+            lang.Lang(
+                en="Bind Unweighted Meshes...",
+                ja=u"ウェイト無しメッシュ一覧バインド...",
+            ).output()
+        )
+        self.open_unweighted_bind_but.setMinimumHeight(28)
+        self.open_unweighted_bind_but.setToolTip(
+            lang.Lang(
+                en="Open a list window showing meshes with no weights and destination bones so you can pick and bind them at a glance.",
+                ja=u"ウェイトが 1 つも入っていないメッシュと割り当て先ボーンを一覧ウィンドウで選択・確認してバインドできます。",
+            ).output()
+        )
+        qt.change_button_color(
+            self.open_unweighted_bind_but,
+            textColor=[235, 230, 255],
+            bgColor=[66, 56, 86],
+            hiColor=[114, 92, 160],
+            mode="button",
+            hover=True,
+            destroy=True,
+            dsColor=[152, 134, 198],
+        )
+        self.open_unweighted_bind_but.clicked.connect(self.open_unweighted_bind_window)
+        bind_btn_row.addWidget(self.open_unweighted_bind_but, 1)
+        bind_layout.addLayout(bind_btn_row)
+        layout.addWidget(bind_box)
+
+        # 高精度スキンウェイト・ミラー（ボーン / メッシュ / 頂点すべて対応）
+        mirror_box = QGroupBox(
+            lang.Lang(
+                en="Precision Skin Weight Mirror (Works with Bones / Meshes / Vertices)",
+                ja=u"高精度スキンウェイト・ミラー（ボーン / メッシュ / 頂点すべて対応）",
+            ).output()
+        )
+        mirror_layout = QVBoxLayout(mirror_box)
+        mirror_layout.setContentsMargins(8, 6, 8, 6)
+        mirror_layout.setSpacing(5)
+
+        mirror_guide = QLabel(
+            lang.Lang(
+                en="Works with Bones (auto-detects mesh & weighted side), 1 Mesh (whole mirror), 2+ Meshes (1st -> 2nd mirror), or Vertices only.",
+                ja=u"ボーン選択（共有メッシュ＆ウェイト側を自動判定）・1 メッシュ全体・2 メッシュ間（1番目→2番目）・選択頂点のみのどれでも動作します。",
+            ).output()
+        )
+        mirror_guide.setWordWrap(True)
+        qt.change_button_color(mirror_guide, textColor=[215, 222, 232], bgColor=[48, 50, 56])
+        mirror_guide.setMargin(5)
+        mirror_layout.addWidget(mirror_guide)
+
+        mir_dir_row = QHBoxLayout()
+        mir_dir_row.setSpacing(6)
+        mir_dir_row.addWidget(QLabel(lang.Lang(en="Direction:", ja=u"ミラー方向:").output()))
+        self.mirror_dir_combo = QComboBox(self)
+        self.mirror_dir_combo.addItem(
+            lang.Lang(
+                en="Auto (From weighted bone / +X -> -X for mesh)",
+                ja=u"自動判定（ボーン選択時はウェイト側から自動 / メッシュは +X → -X）",
+            ).output(),
+            "auto",
+        )
+        self.mirror_dir_combo.addItem(
+            lang.Lang(en="+X -> -X (Character Left -> Right)", ja=u"+X → -X（キャラ左 → 右）").output(),
+            "pos_to_neg",
+        )
+        self.mirror_dir_combo.addItem(
+            lang.Lang(en="-X -> +X (Character Right -> Left)", ja=u"-X → +X（キャラ右 → 左）").output(),
+            "neg_to_pos",
+        )
+        mir_dir_row.addWidget(self.mirror_dir_combo, 2)
+
+        mir_dir_row.addWidget(QLabel(lang.Lang(en="Plane:", ja=u"対称面:").output()))
+        self.mirror_plane_combo = QComboBox(self)
+        self.mirror_plane_combo.addItem("YZ (X)", "YZ")
+        self.mirror_plane_combo.addItem("XZ (Y)", "XZ")
+        self.mirror_plane_combo.addItem("XY (Z)", "XY")
+        self.mirror_plane_combo.setMaximumWidth(86)
+        mir_dir_row.addWidget(self.mirror_plane_combo, 0)
+        mirror_layout.addLayout(mir_dir_row)
+
+        mir_sample_row = QHBoxLayout()
+        mir_sample_row.setSpacing(6)
+        mir_sample_row.addWidget(QLabel(lang.Lang(en="Sampling:", ja=u"補間方式:").output()))
+        self.mirror_sample_combo = QComboBox(self)
+        self.mirror_sample_combo.addItem(
+            lang.Lang(
+                en="Auto (Exact vertex snap + Surface Barycentric for offsets)",
+                ja=u"自動（一致頂点はそのまま / ズレはサーフェス重心補間）",
+            ).output(),
+            "auto",
+        )
+        self.mirror_sample_combo.addItem(
+            lang.Lang(
+                en="Surface Barycentric (Smooth across different topology)",
+                ja=u"サーフェス重心補間（トポロジ違い・非対称向け）",
+            ).output(),
+            "surface",
+        )
+        self.mirror_sample_combo.addItem(
+            lang.Lang(en="Nearest Vertex", ja=u"最寄り頂点").output(),
+            "nearest",
+        )
+        mir_sample_row.addWidget(self.mirror_sample_combo, 1)
+        mirror_layout.addLayout(mir_sample_row)
+
+        mir_opt_grid = QGridLayout()
+        mir_opt_grid.setSpacing(4)
+        self.mirror_children_chk = QCheckBox(
+            lang.Lang(en="Include child bones (on bone selection)", ja=u"子ボーンも含める（ボーン選択時）").output()
+        )
+        self.mirror_children_chk.setChecked(True)
+        mir_opt_grid.addWidget(self.mirror_children_chk, 0, 0)
+
+        self.mirror_auto_add_chk = QCheckBox(
+            lang.Lang(en="Auto-add missing opposite bones", ja=u"未登録の反対側ボーンを自動追加").output()
+        )
+        self.mirror_auto_add_chk.setChecked(True)
+        mir_opt_grid.addWidget(self.mirror_auto_add_chk, 0, 1)
+
+        self.mirror_center_eq_chk = QCheckBox(
+            lang.Lang(en="Equalize center seam weights", ja=u"中央シームの左右ウェイトを均等化").output()
+        )
+        self.mirror_center_eq_chk.setChecked(True)
+        mir_opt_grid.addWidget(self.mirror_center_eq_chk, 1, 0)
+
+        self.mirror_pos_fallback_chk = QCheckBox(
+            lang.Lang(en="Position fallback matching", ja=u"位置フォールバック照合（命名外対応）").output()
+        )
+        self.mirror_pos_fallback_chk.setChecked(True)
+        mir_opt_grid.addWidget(self.mirror_pos_fallback_chk, 1, 1)
+        mirror_layout.addLayout(mir_opt_grid)
+
+        mir_btn_row = QHBoxLayout()
+        mir_btn_row.setSpacing(6)
+        self.exec_precision_mirror_but = QPushButton(
+            lang.Lang(en="Execute Precision Weight Mirror", ja=u"高精度ウェイトミラーを実行").output()
+        )
+        self.exec_precision_mirror_but.setMinimumHeight(30)
+        self.exec_precision_mirror_but.clicked.connect(self.run_precision_weight_mirror)
+        mir_btn_row.addWidget(self.exec_precision_mirror_but, 2)
+
+        self.diag_mirror_but = QPushButton(
+            lang.Lang(en="Check Pairs (Preview)", ja=u"対応ボーン診断").output()
+        )
+        self.diag_mirror_but.setMinimumHeight(30)
+        self.diag_mirror_but.clicked.connect(self.run_diagnose_weight_mirror)
+        mir_btn_row.addWidget(self.diag_mirror_but, 1)
+        mirror_layout.addLayout(mir_btn_row)
+        layout.addWidget(mirror_box)
+
+        # 安全・高精度ウェイトコピー（別メッシュ / 頂点部分コピー / 左右反転コピー対応）
+        copy_box = QGroupBox(
+            lang.Lang(
+                en="Safe & Accurate Weight Copy (Mesh -> Mesh / Vertices / Mirrored Part)",
+                ja=u"安全・高精度ウェイトコピー（別メッシュ / 頂点部分 / 左右パーツ反転対応）",
+            ).output()
+        )
+        copy_layout = QVBoxLayout(copy_box)
+        copy_layout.setContentsMargins(8, 6, 8, 6)
+        copy_layout.setSpacing(5)
+
+        src_row = QHBoxLayout()
+        src_row.setSpacing(6)
+        self.copy_src_label = QLabel(
+            lang.Lang(
+                en="Source Mesh: (Not set - or select Source -> Target meshes directly)",
+                ja=u"コピー元: 未登録（または コピー元 → コピー先 の順に 2 メッシュ直接選択でも可）",
+            ).output()
+        )
+        self.copy_src_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.copy_src_label.setFixedHeight(24)
+        qt.change_button_color(self.copy_src_label, textColor=[200, 225, 245], bgColor=[42, 46, 54])
+        self.copy_src_label.setMargin(4)
+        src_row.addWidget(self.copy_src_label, 1)
+
+        self.set_copy_src_but = QPushButton(
+            lang.Lang(en="Set Source", ja=u"コピー元登録").output()
+        )
+        self.set_copy_src_but.setFixedHeight(24)
+        self.set_copy_src_but.clicked.connect(self.register_weight_copy_source)
+        src_row.addWidget(self.set_copy_src_but, 0)
+
+        self.clear_copy_src_but = QPushButton(
+            lang.Lang(en="Clear", ja=u"クリア").output()
+        )
+        self.clear_copy_src_but.setFixedHeight(24)
+        self.clear_copy_src_but.setMaximumWidth(56)
+        self.clear_copy_src_but.clicked.connect(self.clear_weight_copy_source)
+        src_row.addWidget(self.clear_copy_src_but, 0)
+        copy_layout.addLayout(src_row)
+
+        copy_mode_row = QHBoxLayout()
+        copy_mode_row.setSpacing(6)
+        copy_mode_row.addWidget(QLabel(lang.Lang(en="Transfer:", ja=u"転送方式:").output()))
+        self.copy_mode_combo = QComboBox(self)
+        self.copy_mode_combo.addItem(
+            lang.Lang(
+                en="Auto (Index if matching / Surface Barycentric otherwise)",
+                ja=u"自動（頂点一致はインデックス / 異なる場合はサーフェス重心補間）",
+            ).output(),
+            "auto",
+        )
+        self.copy_mode_combo.addItem(
+            lang.Lang(
+                en="Surface Barycentric (Best for clothing / different topology)",
+                ja=u"サーフェス重心補間（衣装・別トポロジ向け）",
+            ).output(),
+            "surface",
+        )
+        self.copy_mode_combo.addItem(
+            lang.Lang(en="Nearest Vertex", ja=u"最寄り頂点").output(),
+            "nearest",
+        )
+        self.copy_mode_combo.addItem(
+            lang.Lang(en="Vertex Index Only (Same topology)", ja=u"頂点インデックス（同一トポロジ専用）").output(),
+            "index",
+        )
+        copy_mode_row.addWidget(self.copy_mode_combo, 1)
+        copy_layout.addLayout(copy_mode_row)
+
+        copy_opt_row = QHBoxLayout()
+        copy_opt_row.setSpacing(10)
+        self.copy_mirror_chk = QCheckBox(
+            lang.Lang(en="Mirror L <-> R while copying", ja=u"左右反転（ミラー）してコピー").output()
+        )
+        self.copy_mirror_chk.setChecked(False)
+        copy_opt_row.addWidget(self.copy_mirror_chk)
+
+        self.copy_auto_bind_chk = QCheckBox(
+            lang.Lang(en="Auto-bind / add missing bones", ja=u"未バインド自動バインド＆不足ボーン追加").output()
+        )
+        self.copy_auto_bind_chk.setChecked(True)
+        copy_opt_row.addWidget(self.copy_auto_bind_chk)
+        copy_opt_row.addStretch(1)
+        copy_layout.addLayout(copy_opt_row)
+
+        self.exec_safe_copy_but = QPushButton(
+            lang.Lang(
+                en="Copy Weights Safely to Selected Mesh(es) / Vertices",
+                ja=u"選択メッシュ / 頂点へ安全にウェイトをコピー",
+            ).output()
+        )
+        self.exec_safe_copy_but.setMinimumHeight(30)
+        self.exec_safe_copy_but.clicked.connect(self.run_safe_weight_copy)
+        copy_layout.addWidget(self.exec_safe_copy_but)
+        layout.addWidget(copy_box)
+
+        layout.addStretch(1)
+        return outer
+
+    # ------------------------------------------------------------------
     # タブ構築：ジョイント整理 ＆ Joint Orient
     # ------------------------------------------------------------------
     def _build_joint_orient_tab(self):
+        outer = QWidget(self)
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
         tab = QWidget(self)
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+        scroll.setWidget(tab)
+        outer_layout.addWidget(scroll)
 
         # 対象範囲設定
         scope_row = QHBoxLayout()
@@ -929,6 +1500,333 @@ class ModelEditWindow(qt.SubWindow):
         )
         self.jnt_include_children_chk.setChecked(True)
         scope_row.addWidget(self.jnt_include_children_chk)
+        layout.addLayout(scope_row)
+
+        # ビューポート選択ジョイントの表示サイズ（Radius）リアルタイム調整
+        radius_box = QGroupBox(
+            lang.Lang(
+                en="Selected Joint Radius (Real-Time)",
+                ja=u"選択ジョイントの大きさ調整（Radius リアルタイム反映）",
+            ).output()
+        )
+        radius_layout = QVBoxLayout(radius_box)
+        radius_layout.setContentsMargins(8, 6, 8, 6)
+        radius_layout.setSpacing(4)
+
+        radius_row = QHBoxLayout()
+        radius_row.setSpacing(6)
+        radius_row.addWidget(QLabel("Radius:"))
+
+        self.jnt_radius_slider = QSlider(Qt.Horizontal, self)
+        self.jnt_radius_slider.setRange(1, 1000)
+        self.jnt_radius_slider.setValue(100)
+        self.jnt_radius_slider.setToolTip(
+            lang.Lang(
+                en="Drag to adjust selected joint Radius in real time (0.01 - 10.00)",
+                ja=u"ドラッグして選択中ジョイントの Radius をリアルタイム調整（0.01 ～ 10.00）",
+            ).output()
+        )
+        self.jnt_radius_slider.sliderPressed.connect(self._on_radius_slider_pressed)
+        self.jnt_radius_slider.valueChanged.connect(self._on_radius_slider_changed)
+        self.jnt_radius_slider.sliderReleased.connect(self._on_radius_slider_released)
+        radius_row.addWidget(self.jnt_radius_slider, 1)
+
+        self.jnt_radius_spin = QDoubleSpinBox(self)
+        self.jnt_radius_spin.setRange(0.01, 1000.0)
+        self.jnt_radius_spin.setDecimals(2)
+        self.jnt_radius_spin.setSingleStep(0.1)
+        self.jnt_radius_spin.setValue(1.0)
+        self.jnt_radius_spin.setMinimumWidth(78)
+        self.jnt_radius_spin.setToolTip(
+            lang.Lang(
+                en="Enter exact Radius value for selected joint(s) in real time",
+                ja=u"選択中ジョイントの Radius 値を数値入力でリアルタイム反映",
+            ).output()
+        )
+        self.jnt_radius_spin.valueChanged.connect(self._on_radius_spin_changed)
+        radius_row.addWidget(self.jnt_radius_spin, 0)
+
+        self.jnt_radius_children_chk = QCheckBox(
+            lang.Lang(en="Children", ja=u"子も含める").output()
+        )
+        self.jnt_radius_children_chk.setChecked(False)
+        self.jnt_radius_children_chk.setToolTip(
+            lang.Lang(
+                en="Also adjust Radius of child joints under the viewport selection",
+                ja=u"チェックすると選択ジョイント配下の子ジョイントにも Radius を一括適用します",
+            ).output()
+        )
+        radius_row.addWidget(self.jnt_radius_children_chk, 0)
+
+        self.jnt_radius_sync_but = QPushButton(
+            lang.Lang(en="Sync", ja=u"取得").output()
+        )
+        self.jnt_radius_sync_but.setMaximumWidth(56)
+        self.jnt_radius_sync_but.setToolTip(
+            lang.Lang(
+                en="Read current Radius from selected joint(s)",
+                ja=u"現在選択中ジョイントの Radius 値を読み込みます",
+            ).output()
+        )
+        self.jnt_radius_sync_but.clicked.connect(lambda: self._sync_radius_from_selection(show_status=True))
+        radius_row.addWidget(self.jnt_radius_sync_but, 0)
+        radius_layout.addLayout(radius_row)
+
+        self.jnt_radius_info_label = QLabel(
+            lang.Lang(
+                en="Viewport Selection: No joint selected",
+                ja=u"ビューポート選択: ジョイント未選択",
+            ).output()
+        )
+        self.jnt_radius_info_label.setStyleSheet("color: #aeb6c4; font-size: 11px;")
+        radius_layout.addWidget(self.jnt_radius_info_label)
+        layout.addWidget(radius_box)
+
+        # 選択ボーン回転フリーズ（子ボーン含めキー退避＆書き戻し・0F=0 / 0F以降そのまま復元）
+        freeze_rot_box = QGroupBox(
+            lang.Lang(
+                en="Freeze Selected Bone Rotation (Preserve Keyframes of Selected & Child Bones)",
+                ja=u"選択ボーンの回転 XYZ フリーズ（子ボーン含めキー保存＆書き戻し）",
+            ).output()
+        )
+        freeze_rot_layout = QVBoxLayout(freeze_rot_box)
+        freeze_rot_layout.setContentsMargins(8, 6, 8, 6)
+        freeze_rot_layout.setSpacing(5)
+
+        freeze_rot_guide = QLabel(
+            lang.Lang(
+                en=(
+                    "Bakes current Rotate XYZ of selected bone(s) into jointOrient and resets Rotate to (0, 0, 0).\n"
+                    "Saves and restores keyframes of both selected and child bones (Base Frame -> 0, frames after Base Frame kept verbatim)."
+                ),
+                ja=(
+                    u"選択ボーンの現在の回転 XYZ を jointOrient へ焼き込んで 0 へ戻します。\n"
+                    u"選択ボーンと子ボーンのキーフレームを退避・書き戻し、基準フレーム（0F）は 0、0F 以降の値はそのまま復元します。"
+                ),
+            ).output()
+        )
+        freeze_rot_guide.setWordWrap(True)
+        qt.change_button_color(freeze_rot_guide, textColor=[215, 222, 232], bgColor=[48, 50, 56])
+        freeze_rot_guide.setMargin(5)
+        freeze_rot_layout.addWidget(freeze_rot_guide)
+
+        freeze_rot_opt_row = QHBoxLayout()
+        freeze_rot_opt_row.setSpacing(8)
+        freeze_rot_opt_row.addWidget(
+            QLabel(lang.Lang(en="Base Frame (A-Pose):", ja=u"基準フレーム（Aポーズ）:").output())
+        )
+        self.freeze_rot_base_frame_spin = QSpinBox(self)
+        self.freeze_rot_base_frame_spin.setRange(-100000, 100000)
+        self.freeze_rot_base_frame_spin.setValue(0)
+        self.freeze_rot_base_frame_spin.setMaximumWidth(72)
+        self.freeze_rot_base_frame_spin.setToolTip(
+            lang.Lang(
+                en="Frame to freeze Rotate XYZ to (0, 0, 0). Keyframes on other frames are restored verbatim.",
+                ja=u"回転 XYZ を (0, 0, 0) にフリーズする基準フレーム（デフォルト: 0）。これ以外のフレームのキー値はそのまま復元されます。",
+            ).output()
+        )
+        freeze_rot_opt_row.addWidget(self.freeze_rot_base_frame_spin)
+
+        self.freeze_rot_children_chk = QCheckBox(
+            lang.Lang(
+                en="Also freeze rotation of child bones (child keyframes are always preserved)",
+                ja=u"子ボーンも回転フリーズ対象に含める（OFF でも子キーは常に保存＆復元）",
+            ).output()
+        )
+        self.freeze_rot_children_chk.setChecked(False)
+        freeze_rot_opt_row.addWidget(self.freeze_rot_children_chk)
+        freeze_rot_opt_row.addStretch(1)
+        freeze_rot_layout.addLayout(freeze_rot_opt_row)
+
+        self.exec_freeze_rot_keep_keys_but = QPushButton(
+            lang.Lang(
+                en="Freeze Selected Bone Rotate -> 0 (Save & Restore Keys)",
+                ja=u"選択ボーンの回転をフリーズして 0 に戻す（子含めキー保存＆書き戻し）",
+            ).output()
+        )
+        self.exec_freeze_rot_keep_keys_but.setMinimumHeight(28)
+        self.exec_freeze_rot_keep_keys_but.clicked.connect(self.run_freeze_selected_bone_rot_keep_keys)
+        freeze_rot_layout.addWidget(self.exec_freeze_rot_keep_keys_but)
+        layout.addWidget(freeze_rot_box)
+
+        # Orient Joint Options（画像準拠）
+        orient_box = QGroupBox(
+            lang.Lang(en="Orient Joint Options", ja=u"Orient Joint 設定（ジョイントの方向付け）").output()
+        )
+        orient_layout = QVBoxLayout(orient_box)
+        orient_layout.setSpacing(5)
+
+        self.oj_world_chk = QCheckBox(
+            lang.Lang(en="Orient Joint to World", ja=u"Orient Joint to World（ワールド軸に揃える）").output()
+        )
+        self.oj_world_chk.setChecked(False)
+        self.oj_world_chk.toggled.connect(self._update_orient_controls_enabled)
+        orient_layout.addWidget(self.oj_world_chk)
+
+        axis_grid = QGridLayout()
+        axis_grid.setSpacing(4)
+
+        # Primary Axis
+        axis_grid.addWidget(QLabel(lang.Lang(en="Primary Axis:", ja=u"主軸 (Primary Axis):").output()), 0, 0)
+        self.primary_group = QButtonGroup(self)
+        self.primary_radios = {}
+        for col, ax in enumerate(("X", "Y", "Z"), start=1):
+            rb = QRadioButton(ax)
+            if ax == "X":
+                rb.setChecked(True)
+            rb.toggled.connect(self._on_primary_axis_changed)
+            self.primary_group.addButton(rb)
+            self.primary_radios[ax] = rb
+            axis_grid.addWidget(rb, 0, col)
+
+        # Secondary Axis
+        axis_grid.addWidget(QLabel(lang.Lang(en="Secondary Axis:", ja=u"副軸 (Secondary Axis):").output()), 1, 0)
+        self.secondary_group = QButtonGroup(self)
+        self.secondary_radios = {}
+        for col, ax in enumerate(("X", "Y", "Z", "None"), start=1):
+            label_ax = lang.Lang(en="None", ja=u"なし").output() if ax == "None" else ax
+            rb = QRadioButton(label_ax)
+            if ax == "Y":
+                rb.setChecked(True)
+            rb.toggled.connect(self._on_secondary_axis_changed)
+            self.secondary_group.addButton(rb)
+            self.secondary_radios[ax] = rb
+            axis_grid.addWidget(rb, 1, col)
+
+        # Secondary Axis World Orientation
+        axis_grid.addWidget(
+            QLabel(
+                lang.Lang(
+                    en="Secondary Axis World Orientation:",
+                    ja=u"副軸のワールド方向 (Secondary World):",
+                ).output()
+            ),
+            2,
+            0,
+        )
+        self.world_axis_group = QButtonGroup(self)
+        self.world_axis_radios = {}
+        for col, ax in enumerate(("X", "Y", "Z"), start=1):
+            rb = QRadioButton(ax)
+            if ax == "Z":
+                rb.setChecked(True)
+            self.world_axis_group.addButton(rb)
+            self.world_axis_radios[ax] = rb
+            axis_grid.addWidget(rb, 2, col)
+
+        self.world_sign_combo = QComboBox(self)
+        self.world_sign_combo.addItem("+")
+        self.world_sign_combo.addItem("-")
+        self.world_sign_combo.setCurrentIndex(1)
+        self.world_sign_combo.setMaximumWidth(54)
+        axis_grid.addWidget(self.world_sign_combo, 2, 4)
+
+        self._orient_axis_widgets = (
+            list(self.primary_radios.values())
+            + list(self.secondary_radios.values())
+            + list(self.world_axis_radios.values())
+            + [self.world_sign_combo]
+        )
+        orient_layout.addLayout(axis_grid)
+
+        self.oj_children_chk = QCheckBox(
+            lang.Lang(
+                en="Orient children of selected joints",
+                ja=u"子ジョイントも方向付け (Orient children of selected joints)",
+            ).output()
+        )
+        self.oj_children_chk.setChecked(True)
+        orient_layout.addWidget(self.oj_children_chk)
+
+        self.oj_scale_chk = QCheckBox(
+            lang.Lang(
+                en="Reorient the local scale axes",
+                ja=u"ローカルスケール軸も再方向付け (Reorient local scale axes)",
+            ).output()
+        )
+        self.oj_scale_chk.setChecked(True)
+        orient_layout.addWidget(self.oj_scale_chk)
+
+        self.oj_zero_end_chk = QCheckBox(
+            lang.Lang(
+                en="Zero jointOrient on end (leaf) joints to match parent",
+                ja=u"末端（エンド）ジョイントの jointOrient を 0 に揃える（親の向きに一致）",
+            ).output()
+        )
+        self.oj_zero_end_chk.setChecked(True)
+        orient_layout.addWidget(self.oj_zero_end_chk)
+
+        oj_btn_row = QHBoxLayout()
+        self.exec_oj_but = QPushButton(
+            lang.Lang(en="Apply Orient Joint", ja=u"Orient Joint を実行").output()
+        )
+        self.exec_oj_but.setMinimumHeight(28)
+        self.exec_oj_but.clicked.connect(self.run_orient_joints)
+        oj_btn_row.addWidget(self.exec_oj_but, 2)
+
+        self.toggle_lra_but = QPushButton(
+            lang.Lang(en="Toggle Local Axes Visibility", ja=u"ローカル軸表示を切替").output()
+        )
+        self.toggle_lra_but.setMinimumHeight(28)
+        self.toggle_lra_but.clicked.connect(self.run_toggle_local_axes)
+        oj_btn_row.addWidget(self.toggle_lra_but, 1)
+        orient_layout.addLayout(oj_btn_row)
+        layout.addWidget(orient_box)
+
+        # ローカル軸の微調整（子位置を維持したまま ±90° / 180° 回転）
+        tweak_box = QGroupBox(
+            lang.Lang(
+                en="Manual Local Axis Tweak (Keeps child world positions)",
+                ja=u"軸の向き微調整（子ジョイントの位置を保ったまま Joint Orient を回転）",
+            ).output()
+        )
+        tweak_grid = QGridLayout(tweak_box)
+        tweak_grid.setSpacing(4)
+        for row_idx, ax in enumerate(("X", "Y", "Z")):
+            lbl = QLabel(lang.Lang(en="{0} Axis:", ja=u"{0} 軸:").output().format(ax))
+            tweak_grid.addWidget(lbl, row_idx, 0)
+            for col_idx, deg in enumerate((-90, 90, 180), start=1):
+                sign_txt = "+{0}".format(deg) if deg > 0 else str(deg)
+                btn = QPushButton(u"{0}°".format(sign_txt))
+                btn.clicked.connect(lambda _=False, a=ax, d=deg: self.run_tweak_orient(a, d))
+                tweak_grid.addWidget(btn, row_idx, col_idx)
+        layout.addWidget(tweak_box)
+
+        layout.addStretch(1)
+        return outer
+
+    # ------------------------------------------------------------------
+    # タブ構築：ジョイント診断 ＆ 回転等調整（強制フリーズ一括）
+    # ------------------------------------------------------------------
+    def _build_joint_inspect_tab(self):
+        outer = QWidget(self)
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+        scroll.setWidget(tab)
+        outer_layout.addWidget(scroll)
+
+        # 対象範囲設定（ジョイント整理タブ側のチェックボックスと相互同期）
+        scope_row = QHBoxLayout()
+        self.jnt_inspect_include_children_chk = QCheckBox(
+            lang.Lang(
+                en="Include child joints in hierarchy (for Inspect / Clean / Force Freeze)",
+                ja=u"選択ジョイントの子階層も含めて対象にする（診断・値整理・強制フリーズ）",
+            ).output()
+        )
+        self.jnt_inspect_include_children_chk.setChecked(self.jnt_include_children_chk.isChecked())
+        self.jnt_inspect_include_children_chk.toggled.connect(self._sync_include_children_from_inspect)
+        self.jnt_include_children_chk.toggled.connect(self._sync_include_children_from_orient)
+        scope_row.addWidget(self.jnt_inspect_include_children_chk)
         layout.addLayout(scope_row)
 
         # ジョイント回転・スケール診断と整理
@@ -965,7 +1863,8 @@ class ModelEditWindow(qt.SubWindow):
         self.joint_issue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.joint_issue_table.verticalHeader().setVisible(False)
         self.joint_issue_table.verticalHeader().setDefaultSectionSize(20)
-        self.joint_issue_table.setMaximumHeight(125)
+        self.joint_issue_table.setMinimumHeight(140)
+        self.joint_issue_table.setMaximumHeight(220)
         self.joint_issue_table.itemClicked.connect(self._on_joint_issue_clicked)
 
         j_header = self.joint_issue_table.horizontalHeader()
@@ -997,129 +1896,470 @@ class ModelEditWindow(qt.SubWindow):
         norm_layout.addLayout(clean_btn_row)
         layout.addWidget(norm_box)
 
-        # Orient Joint Options（画像準拠）
-        orient_box = QGroupBox(
-            lang.Lang(en="Orient Joint Options", ja=u"Orient Joint 設定（ジョイントの方向付け）").output()
-        )
-        orient_layout = QVBoxLayout(orient_box)
-        orient_layout.setSpacing(5)
-
-        self.oj_world_chk = QCheckBox(
-            lang.Lang(en="Orient Joint to World", ja=u"Orient Joint to World（ワールド軸に揃える）").output()
-        )
-        self.oj_world_chk.setChecked(False)
-        self.oj_world_chk.toggled.connect(self._update_orient_controls_enabled)
-        orient_layout.addWidget(self.oj_world_chk)
-
-        axis_grid = QGridLayout()
-        axis_grid.setSpacing(4)
-
-        # Primary Axis
-        axis_grid.addWidget(QLabel("Primary Axis:"), 0, 0)
-        self.primary_group = QButtonGroup(self)
-        self.primary_radios = {}
-        for col, ax in enumerate(("X", "Y", "Z"), start=1):
-            rb = QRadioButton(ax)
-            if ax == "X":
-                rb.setChecked(True)
-            rb.toggled.connect(self._on_primary_axis_changed)
-            self.primary_group.addButton(rb)
-            self.primary_radios[ax] = rb
-            axis_grid.addWidget(rb, 0, col)
-
-        # Secondary Axis
-        axis_grid.addWidget(QLabel("Secondary Axis:"), 1, 0)
-        self.secondary_group = QButtonGroup(self)
-        self.secondary_radios = {}
-        for col, ax in enumerate(("X", "Y", "Z", "None"), start=1):
-            rb = QRadioButton(ax)
-            if ax == "Y":
-                rb.setChecked(True)
-            rb.toggled.connect(self._on_secondary_axis_changed)
-            self.secondary_group.addButton(rb)
-            self.secondary_radios[ax] = rb
-            axis_grid.addWidget(rb, 1, col)
-
-        # Secondary Axis World Orientation
-        axis_grid.addWidget(QLabel("Secondary Axis World Orientation:"), 2, 0)
-        self.world_axis_group = QButtonGroup(self)
-        self.world_axis_radios = {}
-        for col, ax in enumerate(("X", "Y", "Z"), start=1):
-            rb = QRadioButton(ax)
-            if ax == "Z":
-                rb.setChecked(True)
-            self.world_axis_group.addButton(rb)
-            self.world_axis_radios[ax] = rb
-            axis_grid.addWidget(rb, 2, col)
-
-        self.world_sign_combo = QComboBox(self)
-        self.world_sign_combo.addItem("+")
-        self.world_sign_combo.addItem("-")
-        self.world_sign_combo.setCurrentIndex(1)
-        self.world_sign_combo.setMaximumWidth(54)
-        axis_grid.addWidget(self.world_sign_combo, 2, 4)
-
-        self._orient_axis_widgets = (
-            list(self.primary_radios.values())
-            + list(self.secondary_radios.values())
-            + list(self.world_axis_radios.values())
-            + [self.world_sign_combo]
-        )
-        orient_layout.addLayout(axis_grid)
-
-        self.oj_children_chk = QCheckBox("Orient children of selected joints")
-        self.oj_children_chk.setChecked(True)
-        orient_layout.addWidget(self.oj_children_chk)
-
-        self.oj_scale_chk = QCheckBox("Reorient the local scale axes")
-        self.oj_scale_chk.setChecked(True)
-        orient_layout.addWidget(self.oj_scale_chk)
-
-        self.oj_zero_end_chk = QCheckBox(
+        # 回転等調整 → ポーズ（キーフレーム）書き出し → 接続解除フリーズ → キーフレーム書き戻し一括実行
+        freeze_box = QGroupBox(
             lang.Lang(
-                en="Zero jointOrient on end (leaf) joints to match parent",
-                ja=u"末端（エンド）ジョイントの jointOrient を 0 に揃える（親の向きに一致）",
+                en="Adjust Rotation -> Export Pose -> Force Freeze -> Write Back Keyframes",
+                ja=u"回転等調整 → ポーズ書き出し → 強制フリーズ → キーフレーム書き戻し（一括実行）",
             ).output()
         )
-        self.oj_zero_end_chk.setChecked(True)
-        orient_layout.addWidget(self.oj_zero_end_chk)
+        freeze_layout = QVBoxLayout(freeze_box)
+        freeze_layout.setContentsMargins(8, 6, 8, 6)
+        freeze_layout.setSpacing(5)
 
-        oj_btn_row = QHBoxLayout()
-        self.exec_oj_but = QPushButton(
-            lang.Lang(en="Apply Orient Joint", ja=u"Orient Joint を実行").output()
+        fz_adj_row = QHBoxLayout()
+        fz_adj_row.setSpacing(6)
+        fz_adj_row.addWidget(
+            QLabel(lang.Lang(en="Rotate Adjust (deg):", ja=u"回転調整 (度):").output())
         )
-        self.exec_oj_but.setMinimumHeight(28)
-        self.exec_oj_but.clicked.connect(self.run_orient_joints)
-        oj_btn_row.addWidget(self.exec_oj_but, 2)
+        self.fz_rot_adj_spins = {}
+        for ax in ("X", "Y", "Z"):
+            fz_adj_row.addWidget(QLabel(ax + ":"))
+            sp = QDoubleSpinBox(self)
+            sp.setRange(-360.0, 360.0)
+            sp.setDecimals(2)
+            sp.setSingleStep(5.0)
+            sp.setValue(0.0)
+            sp.setMaximumWidth(74)
+            sp.setToolTip(
+                lang.Lang(
+                    en="Optional relative rotation offset applied before freeze (leave 0 to use current viewport pose).",
+                    ja=u"フリーズ前に適用する任意の回転オフセット角度（0 のままなら現在のビューポート調整姿勢をそのまま使用）。",
+                ).output()
+            )
+            self.fz_rot_adj_spins[ax] = sp
+            fz_adj_row.addWidget(sp)
 
-        self.toggle_lra_but = QPushButton("Toggle Local Axes Visibility")
-        self.toggle_lra_but.setMinimumHeight(28)
-        self.toggle_lra_but.clicked.connect(self.run_toggle_local_axes)
-        oj_btn_row.addWidget(self.toggle_lra_but, 1)
-        orient_layout.addLayout(oj_btn_row)
-        layout.addWidget(orient_box)
+        self.fz_rot_adj_reset_but = QPushButton("0")
+        self.fz_rot_adj_reset_but.setMaximumWidth(28)
+        self.fz_rot_adj_reset_but.setToolTip(
+            lang.Lang(en="Reset rotation adjust values to 0", ja=u"回転調整値を 0 にリセット").output()
+        )
+        self.fz_rot_adj_reset_but.clicked.connect(self._reset_force_freeze_rotate_adjust)
+        fz_adj_row.addWidget(self.fz_rot_adj_reset_but)
+        fz_adj_row.addStretch(1)
+        freeze_layout.addLayout(fz_adj_row)
 
-        # ローカル軸の微調整（子位置を維持したまま ±90° / 180° 回転）
-        tweak_box = QGroupBox(
+        fz_ch_row = QHBoxLayout()
+        fz_ch_row.setSpacing(10)
+        self.fz_rot_chk = QCheckBox("Rotate")
+        self.fz_rot_chk.setChecked(True)
+        fz_ch_row.addWidget(self.fz_rot_chk)
+
+        self.fz_scl_chk = QCheckBox("Scale")
+        self.fz_scl_chk.setChecked(True)
+        fz_ch_row.addWidget(self.fz_scl_chk)
+
+        self.fz_trans_chk = QCheckBox("Translate")
+        self.fz_trans_chk.setChecked(False)
+        self.fz_trans_chk.setToolTip(
             lang.Lang(
-                en="Manual Local Axis Tweak (Keeps child world positions)",
-                ja=u"軸の向き微調整（子ジョイントの位置を保ったまま Joint Orient を回転）",
+                en="Warning: Freezing Translate on joints resets pivot to origin (keep OFF normally).",
+                ja=u"注意：ジョイントで Translate をフリーズするとピボットが原点移動するため通常は OFF 推奨です。",
             ).output()
         )
-        tweak_grid = QGridLayout(tweak_box)
-        tweak_grid.setSpacing(4)
-        for row_idx, ax in enumerate(("X", "Y", "Z")):
-            lbl = QLabel(u"{0} 軸:".format(ax))
-            tweak_grid.addWidget(lbl, row_idx, 0)
-            for col_idx, deg in enumerate((-90, 90, 180), start=1):
-                sign_txt = "+{0}".format(deg) if deg > 0 else str(deg)
-                btn = QPushButton(u"{0}°".format(sign_txt))
-                btn.clicked.connect(lambda _=False, a=ax, d=deg: self.run_tweak_orient(a, d))
-                tweak_grid.addWidget(btn, row_idx, col_idx)
-        layout.addWidget(tweak_box)
+        fz_ch_row.addWidget(self.fz_trans_chk)
+
+        self.fz_clean_anim_chk = QCheckBox(
+            lang.Lang(en="Clean orphan animCurves", ja=u"孤立キー削除").output()
+        )
+        self.fz_clean_anim_chk.setChecked(True)
+        fz_ch_row.addWidget(self.fz_clean_anim_chk)
+
+        self.fz_use_frame_chk = QCheckBox(
+            lang.Lang(en="Freeze frame:", ja=u"基準フレーム:").output()
+        )
+        self.fz_use_frame_chk.setChecked(False)
+        fz_ch_row.addWidget(self.fz_use_frame_chk)
+
+        self.fz_frame_spin = QSpinBox(self)
+        self.fz_frame_spin.setRange(-100000, 100000)
+        self.fz_frame_spin.setValue(0)
+        self.fz_frame_spin.setMaximumWidth(62)
+        self.fz_frame_spin.setEnabled(False)
+        self.fz_use_frame_chk.toggled.connect(self.fz_frame_spin.setEnabled)
+        fz_ch_row.addWidget(self.fz_frame_spin)
+        fz_ch_row.addStretch(1)
+        freeze_layout.addLayout(fz_ch_row)
+
+        fz_btn_row = QHBoxLayout()
+        fz_btn_row.setSpacing(6)
+        self.exec_force_freeze_but = QPushButton(
+            lang.Lang(
+                en="Adjust -> Export Pose -> Freeze -> Write Back Keyframes",
+                ja=u"回転調整 → ポーズ書き出し → フリーズ → キー書き戻し（一括実行）",
+            ).output()
+        )
+        self.exec_force_freeze_but.setMinimumHeight(30)
+        self.exec_force_freeze_but.clicked.connect(self.run_force_freeze_joints)
+        fz_btn_row.addWidget(self.exec_force_freeze_but, 1)
+
+        self.open_pose_json_dir_but = QPushButton(
+            lang.Lang(en="JSON Folder", ja=u"JSON フォルダ").output()
+        )
+        self.open_pose_json_dir_but.setMinimumHeight(30)
+        self.open_pose_json_dir_but.clicked.connect(self.open_pose_backup_folder)
+        fz_btn_row.addWidget(self.open_pose_json_dir_but, 0)
+        freeze_layout.addLayout(fz_btn_row)
+        layout.addWidget(freeze_box)
 
         layout.addStretch(1)
-        return tab
+        return outer
+
+    def _sync_include_children_from_inspect(self, checked):
+        """ジョイント診断タブ側の子階層チェック状態をジョイント整理タブ側と同期する。"""
+        if hasattr(self, "jnt_include_children_chk") and self.jnt_include_children_chk.isChecked() != checked:
+            self.jnt_include_children_chk.blockSignals(True)
+            self.jnt_include_children_chk.setChecked(checked)
+            self.jnt_include_children_chk.blockSignals(False)
+
+    def _sync_include_children_from_orient(self, checked):
+        """ジョイント整理タブ側の子階層チェック状態をジョイント診断タブ側と同期する。"""
+        if hasattr(self, "jnt_inspect_include_children_chk") and self.jnt_inspect_include_children_chk.isChecked() != checked:
+            self.jnt_inspect_include_children_chk.blockSignals(True)
+            self.jnt_inspect_include_children_chk.setChecked(checked)
+            self.jnt_inspect_include_children_chk.blockSignals(False)
+
+    def set_tab_visible(self, tab_key, visible):
+        """指定したキーのタブの表示・非表示を Python から切り替える。"""
+        if tab_key not in self._tab_entries:
+            raise KeyError("Unknown tab key: {0} (valid: {1})".format(tab_key, ", ".join(self._tab_order)))
+        is_vis = bool(visible)
+        self._tab_visibility[tab_key] = is_vis
+        entry = self._tab_entries[tab_key]
+        widget = entry["widget"]
+
+        if hasattr(self.tabs, "setTabVisible"):
+            idx = self.tabs.indexOf(widget)
+            if idx >= 0:
+                self.tabs.setTabVisible(idx, is_vis)
+            return
+
+        # PySide2 互換フォールバック（insertTab / removeTab で順序を保って切り替える）
+        idx = self.tabs.indexOf(widget)
+        if is_vis and idx < 0:
+            insert_pos = 0
+            for key in self._tab_order:
+                if key == tab_key:
+                    break
+                if self.tabs.indexOf(self._tab_entries[key]["widget"]) >= 0:
+                    insert_pos += 1
+            self.tabs.insertTab(insert_pos, widget, entry["label"])
+        elif (not is_vis) and idx >= 0:
+            self.tabs.removeTab(idx)
+
+    def apply_tab_visibility(self, visibility_map=None):
+        """辞書（TAB_VISIBILITY 形式）に基づいて全タブの表示・非表示を一括適用する。"""
+        target_map = visibility_map if visibility_map is not None else TAB_VISIBILITY
+        for key in self._tab_order:
+            if key in target_map:
+                self.set_tab_visible(key, target_map[key])
+        # 現在選択中のタブが非表示になった場合は最初の表示中タブへ移動する
+        if hasattr(self.tabs, "isTabVisible"):
+            cur_idx = self.tabs.currentIndex()
+            if cur_idx < 0 or not self.tabs.isTabVisible(cur_idx):
+                for i in range(self.tabs.count()):
+                    if self.tabs.isTabVisible(i):
+                        self.tabs.setCurrentIndex(i)
+                        break
+
+    # ------------------------------------------------------------------
+    # タブ構築：リファレンスジョイントによる Local Rotation Axis・構造上書き
+    # ------------------------------------------------------------------
+    def _build_reference_joint_tab(self):
+        outer = QWidget(self)
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+
+        tab = QWidget(self)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        scroll.setWidget(tab)
+        outer_layout.addWidget(scroll)
+
+        # クイック軸方向コピー＆変更（JSON 保存なし・指ボーン等の素早い軸揃え向け）
+        quick_box = QGroupBox(
+            lang.Lang(
+                en="Quick Axis Copy & Apply (No JSON - Fast Finger / Joint Orientation Match)",
+                ja=u"クイック軸方向コピー＆変更（JSON 保存なし・指ボーン等の素早い方向修正）",
+            ).output()
+        )
+        quick_layout = QVBoxLayout(quick_box)
+        quick_layout.setContentsMargins(8, 6, 8, 6)
+        quick_layout.setSpacing(5)
+
+        self.quick_axis_label = QLabel(
+            lang.Lang(
+                en="Stored Axis Direction: (Not stored yet - select a reference bone and click Store)",
+                ja=u"一時保存中の方向: 未保存（手本ボーンを選択して「方向を一時保存」をクリック）",
+            ).output()
+        )
+        self.quick_axis_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.quick_axis_label.setFixedHeight(24)
+        qt.change_button_color(self.quick_axis_label, textColor=[190, 235, 200], bgColor=[40, 48, 44])
+        self.quick_axis_label.setMargin(4)
+        quick_layout.addWidget(self.quick_axis_label)
+
+        quick_btn_row = QHBoxLayout()
+        quick_btn_row.setSpacing(6)
+        self.quick_axis_copy_but = QPushButton(
+            lang.Lang(en="Store Ref Axis (Temp)", ja=u"リファレンス方向を一時保存").output()
+        )
+        self.quick_axis_copy_but.setMinimumHeight(28)
+        self.quick_axis_copy_but.clicked.connect(self.store_quick_axis_reference)
+        quick_btn_row.addWidget(self.quick_axis_copy_but, 2)
+
+        self.quick_axis_apply_but = QPushButton(
+            lang.Lang(en="Apply Axis to Selected", ja=u"選択ボーンの軸方向を変更").output()
+        )
+        self.quick_axis_apply_but.setMinimumHeight(28)
+        self.quick_axis_apply_but.clicked.connect(self.apply_quick_axis_to_selected)
+        quick_btn_row.addWidget(self.quick_axis_apply_but, 2)
+
+        self.quick_axis_lra_but = QPushButton(
+            lang.Lang(en="LRA", ja=u"軸表示").output()
+        )
+        self.quick_axis_lra_but.setMinimumHeight(28)
+        self.quick_axis_lra_but.setMaximumWidth(64)
+        self.quick_axis_lra_but.setToolTip(
+            lang.Lang(
+                en="Toggle Local Rotation Axes visibility on selected bone(s)",
+                ja=u"選択ボーンのローカル回転軸表示（LRA）を切り替えます",
+            ).output()
+        )
+        self.quick_axis_lra_but.clicked.connect(self.toggle_quick_axis_lra)
+        quick_btn_row.addWidget(self.quick_axis_lra_but, 0)
+        quick_layout.addLayout(quick_btn_row)
+
+        quick_opt_row = QHBoxLayout()
+        quick_opt_row.setSpacing(10)
+        self.quick_axis_children_chk = QCheckBox(
+            lang.Lang(en="Include children", ja=u"子階層も含める").output()
+        )
+        self.quick_axis_children_chk.setChecked(False)
+        quick_opt_row.addWidget(self.quick_axis_children_chk)
+
+        self.quick_axis_rot_order_chk = QCheckBox(
+            lang.Lang(en="Match Rotate Order", ja=u"Rotate Order も合わせる").output()
+        )
+        self.quick_axis_rot_order_chk.setChecked(True)
+        quick_opt_row.addWidget(self.quick_axis_rot_order_chk)
+
+        self.quick_axis_skin_chk = QCheckBox(
+            lang.Lang(en="Keep skinned mesh pose (bindPreMatrix)", ja=u"バインド中メッシュ変形防止").output()
+        )
+        self.quick_axis_skin_chk.setChecked(True)
+        self.quick_axis_skin_chk.setToolTip(
+            lang.Lang(
+                en="Updates skinCluster bindPreMatrix automatically so bound meshes stay undeformed without unbinding.",
+                ja=u"ON にするとバインド解除せず skinCluster の bindPreMatrix を即時更新し、メッシュを変形させずに軸だけ差し替えます。",
+            ).output()
+        )
+        quick_opt_row.addWidget(self.quick_axis_skin_chk)
+        quick_opt_row.addStretch(1)
+        quick_layout.addLayout(quick_opt_row)
+
+        self.quick_freeze_rot_but = QPushButton(
+            lang.Lang(
+                en="Freeze Rotation of Selected Bone(s) (Keeps Child Hierarchy Unrotated)",
+                ja=u"選択ボーンの回転をフリーズ（子階層は回転させない）",
+            ).output()
+        )
+        self.quick_freeze_rot_but.setMinimumHeight(26)
+        self.quick_freeze_rot_but.clicked.connect(self.freeze_quick_selected_bone_rotations)
+        quick_layout.addWidget(self.quick_freeze_rot_but)
+        layout.addWidget(quick_box)
+
+        guide = QLabel(
+            lang.Lang(
+                en="Save/Load full Reference skeleton as '[CharName]_Hips' JSON for use across scenes. If Current skeleton is registered, overwrites all joints & reapplies weights; if not registered, creates the Reference skeleton in the scene.",
+                ja=u"リファレンスボーン全体を「[キャラ名等]_Hips」形式で JSON 保存・読込し、他シーンでも再利用できます。\n現在ジョイントが登録済みなら全ジョイントを上書き＆ウェイト再適用し、未登録の場合はリファレンスボーンを新規作成します。",
+            ).output()
+        )
+        guide.setWordWrap(True)
+        qt.change_button_color(guide, textColor=[220, 224, 232], bgColor=[50, 52, 58])
+        guide.setMargin(6)
+        layout.addWidget(guide)
+
+        # スケルトン登録エリア（常に全階層を対象に変更または新規作成）
+        reg_box = QGroupBox(
+            lang.Lang(
+                en="Step 1 : Register Reference & Current Skeleton (Full Hierarchy)",
+                ja=u"ステップ 1：リファレンス ＆ 現在ジョイント登録（全階層対象・他シーン対応）",
+            ).output()
+        )
+        reg_layout = QVBoxLayout(reg_box)
+        reg_layout.setSpacing(6)
+
+        cur_row = QHBoxLayout()
+        self.ref_cur_label = QLabel(
+            lang.Lang(en="Current Skeleton: (Not set -> Create mode)", ja=u"現在のジョイント: 未登録（未登録時はリファレンスを新規作成）").output()
+        )
+        self.ref_cur_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.ref_cur_label.setFixedHeight(24)
+        qt.change_button_color(self.ref_cur_label, textColor=[200, 220, 240], bgColor=[42, 46, 54])
+        self.ref_cur_label.setMargin(4)
+        cur_row.addWidget(self.ref_cur_label, 1)
+
+        self.set_ref_cur_but = QPushButton(
+            lang.Lang(en="Set Current Skeleton", ja=u"現在ジョイント登録").output()
+        )
+        self.set_ref_cur_but.setFixedHeight(24)
+        self.set_ref_cur_but.setMinimumWidth(140)
+        self.set_ref_cur_but.clicked.connect(self.register_current_skeleton_for_ref)
+        cur_row.addWidget(self.set_ref_cur_but, 0)
+
+        self.clear_ref_cur_but = QPushButton(
+            lang.Lang(en="Clear", ja=u"クリア").output()
+        )
+        self.clear_ref_cur_but.setFixedHeight(24)
+        self.clear_ref_cur_but.setMaximumWidth(56)
+        self.clear_ref_cur_but.clicked.connect(self.clear_current_skeleton_for_ref)
+        cur_row.addWidget(self.clear_ref_cur_but, 0)
+        reg_layout.addLayout(cur_row)
+
+        src_row = QHBoxLayout()
+        self.ref_src_label = QLabel(
+            lang.Lang(en="Reference Skeleton: (Not set)", ja=u"リファレンスジョイント: 未登録").output()
+        )
+        self.ref_src_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.ref_src_label.setFixedHeight(24)
+        qt.change_button_color(self.ref_src_label, textColor=[240, 220, 175], bgColor=[50, 46, 40])
+        self.ref_src_label.setMargin(4)
+        src_row.addWidget(self.ref_src_label, 1)
+
+        self.set_ref_src_but = QPushButton(
+            lang.Lang(en="Set Reference Skeleton", ja=u"リファレンス登録（全階層）").output()
+        )
+        self.set_ref_src_but.setFixedHeight(24)
+        self.set_ref_src_but.setMinimumWidth(202)
+        self.set_ref_src_but.clicked.connect(self.register_reference_skeleton)
+        src_row.addWidget(self.set_ref_src_but, 0)
+        reg_layout.addLayout(src_row)
+
+        json_row = QHBoxLayout()
+        self.save_ref_json_but = QPushButton(
+            lang.Lang(en="Save Reference JSON", ja=u"リファレンス JSON 保存").output()
+        )
+        self.save_ref_json_but.clicked.connect(self.save_reference_session_only)
+        json_row.addWidget(self.save_ref_json_but, 1)
+
+        self.load_ref_json_but = QPushButton(
+            lang.Lang(en="Load Reference JSON...", ja=u"リファレンス JSON 読込...").output()
+        )
+        self.load_ref_json_but.clicked.connect(self.load_reference_session_from_json)
+        json_row.addWidget(self.load_ref_json_but, 1)
+
+        self.open_ref_json_dir_but = QPushButton(
+            lang.Lang(en="JSON Folder", ja=u"JSON フォルダ").output()
+        )
+        self.open_ref_json_dir_but.clicked.connect(self.open_reference_session_folder)
+        json_row.addWidget(self.open_ref_json_dir_but, 0)
+        reg_layout.addLayout(json_row)
+        layout.addWidget(reg_box)
+
+        # 上書きオプション
+        opt_box = QGroupBox(
+            lang.Lang(en="Step 2 : Overwrite & Weight Reapply Options", ja=u"ステップ 2：上書き＆ウェイト再適用オプション").output()
+        )
+        opt_layout = QVBoxLayout(opt_box)
+        opt_layout.setSpacing(4)
+
+        self.ref_opt_orient_chk = QCheckBox(
+            lang.Lang(
+                en="Overwrite Local Rotation Axis (jointOrient, keeps child positions)",
+                ja=u"Local Rotation Axis（jointOrient）をリファレンスで上書き（子位置維持・HumanIK 軸修正）",
+            ).output()
+        )
+        self.ref_opt_orient_chk.setChecked(True)
+        opt_layout.addWidget(self.ref_opt_orient_chk)
+
+        self.ref_opt_rot_order_chk = QCheckBox(
+            lang.Lang(
+                en="Match Rotate Order to Reference",
+                ja=u"回転順序（Rotate Order）もリファレンスに合わせる",
+            ).output()
+        )
+        self.ref_opt_rot_order_chk.setChecked(True)
+        opt_layout.addWidget(self.ref_opt_rot_order_chk)
+
+        self.ref_opt_pos_chk = QCheckBox(
+            lang.Lang(
+                en="Also overwrite joint world positions from Reference",
+                ja=u"ジョイントのワールド位置もリファレンスに合わせる",
+            ).output()
+        )
+        self.ref_opt_pos_chk.setChecked(False)
+        opt_layout.addWidget(self.ref_opt_pos_chk)
+
+        self.ref_opt_rename_chk = QCheckBox(
+            lang.Lang(
+                en="Apply joint renames configured in Mapping UI",
+                ja=u"調整 UI で設定したジョイント名リネームを適用する",
+            ).output()
+        )
+        self.ref_opt_rename_chk.setChecked(True)
+        opt_layout.addWidget(self.ref_opt_rename_chk)
+
+        self.ref_opt_bind_added_chk = QCheckBox(
+            lang.Lang(
+                en="Include newly added joints when rebinding skinCluster",
+                ja=u"構造追加した新規ジョイントも再バインド時のインフルエンスに含める",
+            ).output()
+        )
+        self.ref_opt_bind_added_chk.setChecked(True)
+        opt_layout.addWidget(self.ref_opt_bind_added_chk)
+
+        self.ref_opt_auto_dialog_chk = QCheckBox(
+            lang.Lang(
+                en="Automatically open Rename / Structure UI when names or hierarchy differ",
+                ja=u"ジョイント名や構造に差分がある場合は自動でリネーム＆構造調整 UI を開く",
+            ).output()
+        )
+        self.ref_opt_auto_dialog_chk.setChecked(True)
+        opt_layout.addWidget(self.ref_opt_auto_dialog_chk)
+        layout.addWidget(opt_box)
+
+        # 照合サマリー表示と実行ボタン
+        self.ref_summary_label = QLabel(
+            lang.Lang(
+                en="Register both skeletons to inspect naming / hierarchy differences.",
+                ja=u"現在ジョイントとリファレンスジョイントを登録すると差分診断が表示されます。",
+            ).output()
+        )
+        self.ref_summary_label.setWordWrap(True)
+        qt.change_button_color(self.ref_summary_label, textColor=[210, 218, 228], bgColor=[44, 46, 52])
+        self.ref_summary_label.setMargin(6)
+        layout.addWidget(self.ref_summary_label)
+
+        exec_row = QHBoxLayout()
+        exec_row.setSpacing(6)
+        self.open_ref_map_but = QPushButton(
+            lang.Lang(en="Open Rename / Structure UI...", ja=u"リネーム・構造調整 UI を開く...").output()
+        )
+        self.open_ref_map_but.setMinimumHeight(32)
+        self.open_ref_map_but.clicked.connect(self.open_reference_mapping_ui)
+        exec_row.addWidget(self.open_ref_map_but, 1)
+
+        self.exec_ref_overwrite_but = QPushButton(
+            lang.Lang(
+                en="Save JSON & Overwrite / Create Reference Bones",
+                ja=u"JSON 保存 ＆ リファレンスで上書き／新規作成",
+            ).output()
+        )
+        self.exec_ref_overwrite_but.setMinimumHeight(32)
+        self.exec_ref_overwrite_but.clicked.connect(self.run_reference_joint_overwrite)
+        exec_row.addWidget(self.exec_ref_overwrite_but, 2)
+        layout.addLayout(exec_row)
+
+        layout.addStretch(1)
+        return outer
 
     # ------------------------------------------------------------------
     # タブ構築：メッシュ ＆ シーンクリーンアップ
@@ -1143,26 +2383,46 @@ class ModelEditWindow(qt.SubWindow):
         mc_cols = QHBoxLayout()
         mc_cols.setSpacing(12)
 
-        # 左列：Fix by Tesselation（画像設定に準拠）
+        # 左列：Fix by Tesselation
         tess_col = QVBoxLayout()
-        tess_col.addWidget(QLabel(u"<b>Fix by Tesselation</b>"))
-        self.mc_quads_chk = QCheckBox("4-sided faces")
+        tess_col.addWidget(
+            QLabel(
+                lang.Lang(
+                    en="<b>Fix by Tesselation</b>",
+                    ja=u"<b>テッセレーション修正 (Fix by Tesselation)</b>",
+                ).output()
+            )
+        )
+        self.mc_quads_chk = QCheckBox(
+            lang.Lang(en="4-sided faces", ja=u"4角形フェース (4-sided faces)").output()
+        )
         self.mc_quads_chk.setChecked(False)
         tess_col.addWidget(self.mc_quads_chk)
 
-        self.mc_nsided_chk = QCheckBox(u"Faces with more than 4 sides（5角形以上）")
+        self.mc_nsided_chk = QCheckBox(
+            lang.Lang(
+                en="Faces with more than 4 sides",
+                ja=u"5角形以上 (Faces with more than 4 sides)",
+            ).output()
+        )
         self.mc_nsided_chk.setChecked(True)
         tess_col.addWidget(self.mc_nsided_chk)
 
-        self.mc_concave_chk = QCheckBox(u"Concave faces（凹面フェース）")
+        self.mc_concave_chk = QCheckBox(
+            lang.Lang(en="Concave faces", ja=u"凹面フェース (Concave faces)").output()
+        )
         self.mc_concave_chk.setChecked(True)
         tess_col.addWidget(self.mc_concave_chk)
 
-        self.mc_holed_chk = QCheckBox(u"Faces with holes（穴あきフェース）")
+        self.mc_holed_chk = QCheckBox(
+            lang.Lang(en="Faces with holes", ja=u"穴あきフェース (Faces with holes)").output()
+        )
         self.mc_holed_chk.setChecked(True)
         tess_col.addWidget(self.mc_holed_chk)
 
-        self.mc_nonplanar_chk = QCheckBox(u"Non-planar faces（非平面フェース）")
+        self.mc_nonplanar_chk = QCheckBox(
+            lang.Lang(en="Non-planar faces", ja=u"非平面フェース (Non-planar faces)").output()
+        )
         self.mc_nonplanar_chk.setChecked(False)
         tess_col.addWidget(self.mc_nonplanar_chk)
         tess_col.addStretch(1)
@@ -1170,20 +2430,41 @@ class ModelEditWindow(qt.SubWindow):
 
         # 右列：Remove Geometry（不正ジオメトリ）
         geo_col = QVBoxLayout()
-        geo_col.addWidget(QLabel(u"<b>Remove Geometry</b>"))
-        self.mc_lamina_chk = QCheckBox(u"Lamina faces（重なりフェース）")
+        geo_col.addWidget(
+            QLabel(
+                lang.Lang(
+                    en="<b>Remove Geometry</b>",
+                    ja=u"<b>不正ジオメトリ除去 (Remove Geometry)</b>",
+                ).output()
+            )
+        )
+        self.mc_lamina_chk = QCheckBox(
+            lang.Lang(en="Lamina faces", ja=u"重なりフェース (Lamina faces)").output()
+        )
         self.mc_lamina_chk.setChecked(True)
         geo_col.addWidget(self.mc_lamina_chk)
 
-        self.mc_nonmanifold_chk = QCheckBox(u"Nonmanifold geometry（非多様体）")
+        self.mc_nonmanifold_chk = QCheckBox(
+            lang.Lang(en="Nonmanifold geometry", ja=u"非多様体 (Nonmanifold geometry)").output()
+        )
         self.mc_nonmanifold_chk.setChecked(True)
         geo_col.addWidget(self.mc_nonmanifold_chk)
 
-        self.mc_zero_geom_chk = QCheckBox(u"Faces with zero geometry area（面積 0）")
+        self.mc_zero_geom_chk = QCheckBox(
+            lang.Lang(
+                en="Faces with zero geometry area",
+                ja=u"面積 0 フェース (Zero geometry area)",
+            ).output()
+        )
         self.mc_zero_geom_chk.setChecked(False)
         geo_col.addWidget(self.mc_zero_geom_chk)
 
-        self.mc_zero_edge_chk = QCheckBox(u"Edges with zero length（長さ 0）")
+        self.mc_zero_edge_chk = QCheckBox(
+            lang.Lang(
+                en="Edges with zero length",
+                ja=u"長さ 0 エッジ (Zero length edges)",
+            ).output()
+        )
         self.mc_zero_edge_chk.setChecked(False)
         geo_col.addWidget(self.mc_zero_edge_chk)
         geo_col.addStretch(1)
@@ -1280,12 +2561,25 @@ class ModelEditWindow(qt.SubWindow):
     # 共通イベント・ヘルパー
     # ------------------------------------------------------------------
     def closeEvent(self, event):
+        if self._radius_undo_open:
+            try:
+                cmds.undoInfo(closeChunk=True)
+            except Exception:
+                pass
+            self._radius_undo_open = False
+        self._remove_radius_selection_job()
         if self.log_window is not None:
             try:
                 self.log_window.close()
             except Exception:
                 pass
             self.log_window = None
+        if self.unweighted_bind_window is not None:
+            try:
+                self.unweighted_bind_window.close()
+            except Exception:
+                pass
+            self.unweighted_bind_window = None
         if self.editor is not None and getattr(self.editor, "model_edit_window", None) is self:
             self.editor.model_edit_window = None
         super(ModelEditWindow, self).closeEvent(event)
@@ -1353,7 +2647,66 @@ class ModelEditWindow(qt.SubWindow):
                 detail=folder,
             )
         except Exception as exc:
-            self._set_status("Folder open error: {0}".format(exc), error=True)
+            self._set_status(
+                lang.Lang(en="Folder open error: {0}", ja=u"フォルダを開けませんでした: {0}").output().format(exc),
+                error=True,
+            )
+
+    def _update_cached_joint_ui(self):
+        """一時保存中の記憶ジョイント表示ラベルとクリアボタンの状態を更新する。"""
+        if not hasattr(self, "cached_joint_label"):
+            return
+        cached = self._cached_joints or []
+        if not cached:
+            self.cached_joint_label.setText(
+                lang.Lang(
+                    en="Saved Joint: None (Recorded automatically on Step 1)",
+                    ja=u"記憶ジョイント: なし（ステップ 1 実行時に自動記憶）",
+                ).output()
+            )
+            self.cached_joint_label.setToolTip("")
+            self.clear_cached_joint_but.setEnabled(False)
+            return
+
+        short_names = [j.split("|")[-1] for j in cached]
+        head = short_names[0]
+        if len(short_names) > 1:
+            disp = "{0} (+{1})".format(head, len(short_names) - 1)
+        else:
+            disp = head
+
+        is_hips_ok = all(_is_hips_named_joint(j) for j in cached)
+        if is_hips_ok:
+            self.cached_joint_label.setText(
+                lang.Lang(
+                    en="Saved Joint: {0} (auto-used when unselected)",
+                    ja=u"記憶ジョイント: {0}（未選択時に自動使用）",
+                ).output().format(disp)
+            )
+            qt.change_button_color(self.cached_joint_label, textColor=[180, 215, 245], bgColor=[44, 48, 56])
+        else:
+            self.cached_joint_label.setText(
+                lang.Lang(
+                    en="Saved Joint: {0} (Not [Char]_Hips - will ask confirmation)",
+                    ja=u"記憶ジョイント: {0}（[キャラ名]_Hips 以外・開始時に確認）",
+                ).output().format(disp)
+            )
+            qt.change_button_color(self.cached_joint_label, textColor=[255, 200, 120], bgColor=[62, 48, 38])
+        self.cached_joint_label.setToolTip("\n".join(cached[:20]))
+        self.clear_cached_joint_but.setEnabled(True)
+
+    def clear_cached_joint_memory(self):
+        """一時保存していた記憶ジョイント情報をクリアする。"""
+        self._cached_joints = []
+        _clear_last_seed_joints()
+        self._update_cached_joint_ui()
+        self._set_status(
+            lang.Lang(
+                en="Cleared saved joint memory.",
+                ja=u"一時保存していたジョイント記憶をクリアしました。",
+            ).output(),
+            error=False,
+        )
 
     def _get_selected_records(self):
         rows = sorted(set(idx.row() for idx in self.record_table.selectedIndexes()))
@@ -1379,7 +2732,7 @@ class ModelEditWindow(qt.SubWindow):
         return meshes
 
     def _confirm_skinned_joints_edit(self, joints):
-        """編集対象のジョイントがスキニング接続中であればユーザーへ確認ダイアログを出す。"""
+        """修正対象のジョイントがスキニング接続中であればユーザーへ確認ダイアログを出す。"""
         active_skins = rig_cleanup_helper.find_skin_clusters_for_joints(joints)
         if not active_skins:
             return True
@@ -1403,7 +2756,7 @@ class ModelEditWindow(qt.SubWindow):
         storage_dir = _get_storage_dir()
         records = []
         for fname in sorted(os.listdir(storage_dir)):
-            if not fname.lower().endswith(".json"):
+            if not fname.lower().endswith(".json") or fname == LAST_JOINT_CACHE_FILENAME:
                 continue
             full_path = os.path.join(storage_dir, fname)
             try:
@@ -1443,7 +2796,7 @@ class ModelEditWindow(qt.SubWindow):
 
             is_editing = rec["status"] == "editing"
             status_text = (
-                lang.Lang(en="Editing", ja=u"編集中").output()
+                lang.Lang(en="Editing", ja=u"修正中").output()
                 if is_editing
                 else lang.Lang(en="Restored", ja=u"復元済").output()
             )
@@ -1476,7 +2829,7 @@ class ModelEditWindow(qt.SubWindow):
             self.record_table.selectRow(0)
 
     def select_all_editing_records(self):
-        """一覧の中から「編集中」ステータスのバックアップをすべて選択する。"""
+        """一覧の中から「修正中」ステータスのバックアップをすべて選択する。"""
         self.record_table.clearSelection()
         sel_model = self.record_table.selectionModel()
         count = 0
@@ -1487,15 +2840,237 @@ class ModelEditWindow(qt.SubWindow):
                 sel_model.select(QItemSelection(idx_left, idx_right), QItemSelectionModel.Select)
                 count += 1
         self._set_status(
-            lang.Lang(en="Selected {0} editing backup(s).", ja=u"編集中のバックアップを {0} 件選択しました。").output().format(count),
+            lang.Lang(en="Selected {0} editing backup(s).", ja=u"修正中のバックアップを {0} 件選択しました。").output().format(count),
             error=(count == 0),
         )
 
+    @staticmethod
+    def _disable_auto_keyframe_temporarily():
+        """処理中の意図しないキー上書きを防ぐためオートキーを一時停止し、元の状態を返す。"""
+        try:
+            prev_state = bool(cmds.autoKeyframe(query=True, state=True))
+            if prev_state:
+                cmds.autoKeyframe(state=False)
+            return prev_state
+        except Exception:
+            return None
+
+    @staticmethod
+    def _restore_auto_keyframe_state(prev_state):
+        """一時停止していたオートキーを元の状態へ戻す。"""
+        if prev_state is True:
+            try:
+                cmds.autoKeyframe(state=True)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _collect_skeleton_joints_for_meshes(target_meshes):
+        """対象メッシュ群のスキンクラスタに紐づくスケルトン全ジョイントを収集する。"""
+        seed_joints = []
+        seen = set()
+        for mesh_long in (target_meshes or []):
+            sc = _get_skin_cluster(mesh_long)
+            if not sc:
+                continue
+            infs = cmds.ls(cmds.skinCluster(sc, q=True, inf=True) or [], type="joint", long=True) or []
+            for jnt in infs:
+                if jnt not in seen and cmds.objExists(jnt):
+                    seen.add(jnt)
+                    seed_joints.append(jnt)
+        if not seed_joints:
+            return []
+
+        roots = []
+        seen_roots = set()
+        for jnt in seed_joints:
+            cur = jnt
+            while True:
+                parents = cmds.listRelatives(cur, parent=True, type="joint", fullPath=True) or []
+                if not parents:
+                    break
+                cur = parents[0]
+            if cur not in seen_roots:
+                seen_roots.add(cur)
+                roots.append(cur)
+
+        all_joints = list(roots)
+        seen_all = set(roots)
+        for root in roots:
+            desc = cmds.listRelatives(root, allDescendents=True, type="joint", fullPath=True) or []
+            for child in desc:
+                if child not in seen_all and cmds.objExists(child):
+                    seen_all.add(child)
+                    all_joints.append(child)
+        return all_joints
+
+    @classmethod
+    def _inspect_skeleton_rotation_state(cls, target_meshes, edit_frame):
+        """gotoBindPose 実行前にスケルトンの 0F 回転キー有無と現在の回転値を検査する。"""
+        joints = cls._collect_skeleton_joints_for_meshes(target_meshes)
+        pre_rot_map = {}
+        keyed_at_edit_frame = 0
+        non_zero_joints = 0
+
+        for jnt in joints:
+            try:
+                rot = cmds.getAttr(jnt + ".rotate")[0]
+                rot_tuple = (float(rot[0]), float(rot[1]), float(rot[2]))
+            except Exception:
+                rot_tuple = (0.0, 0.0, 0.0)
+            pre_rot_map[jnt] = rot_tuple
+            if any(abs(v) > 1e-4 for v in rot_tuple):
+                non_zero_joints += 1
+
+            if edit_frame is not None:
+                found_key_at_frame = False
+                for axis in ("X", "Y", "Z"):
+                    attr = "{0}.rotate{1}".format(jnt, axis)
+                    t_list = []
+                    try:
+                        t_list = cmds.keyframe(attr, q=True, timeChange=True) or []
+                    except Exception:
+                        t_list = []
+                    if any(abs(float(t) - float(edit_frame)) <= 1e-4 for t in t_list):
+                        found_key_at_frame = True
+                        break
+                if found_key_at_frame:
+                    keyed_at_edit_frame += 1
+
+        return {
+            "joints": joints,
+            "pre_rot_map": pre_rot_map,
+            "keyed_at_edit_frame": keyed_at_edit_frame,
+            "all_zero_rot": bool(joints) and (non_zero_joints == 0),
+        }
+
+    @staticmethod
+    def _sanitize_rotations_after_bind_pose(pre_rot_map):
+        """gotoBindPose 後に混入した微小ノイズを 0.0 へ丸め、大きく変化したボーン一覧を返す。"""
+        drifted = []
+        for jnt, pre_rot in (pre_rot_map or {}).items():
+            if not cmds.objExists(jnt):
+                continue
+            try:
+                cur_rot = cmds.getAttr(jnt + ".rotate")[0]
+            except Exception:
+                continue
+            cleaned = []
+            changed_small = False
+            for val in cur_rot:
+                fv = float(val)
+                if 0.0 < abs(fv) < 1e-4:
+                    cleaned.append(0.0)
+                    changed_small = True
+                else:
+                    cleaned.append(fv)
+            if changed_small:
+                try:
+                    if rig_cleanup_helper._is_attr_editable(jnt, "rotate"):
+                        cmds.setAttr(jnt + ".rotate", cleaned[0], cleaned[1], cleaned[2], type="double3")
+                except Exception:
+                    pass
+            # 実行前は (0, 0, 0) だったのに有意な回転が混入したボーンを検知する
+            if all(abs(v) <= 1e-4 for v in pre_rot) and any(abs(v) > 1e-4 for v in cleaned):
+                drifted.append((jnt.split("|")[-1], cleaned))
+        return drifted
+
+    def _confirm_non_hips_saved_joint(self, joints, is_using_cached=False):
+        """記憶ジョイントが '[キャラ名]_Hips' でない場合にユーザーへ確認ダイアログを出し、採用ジョイント一覧（または None=中止）を返す。"""
+        if not joints or all(_is_hips_named_joint(j) for j in joints):
+            return list(joints)
+
+        disp_names = ", ".join(j.split("|")[-1] for j in joints[:5])
+        if len(joints) > 5:
+            disp_names += " ..."
+        hips_candidate = _find_hips_joint_in_skeleton(joints)
+        hips_short = hips_candidate.split("|")[-1] if hips_candidate else None
+
+        if is_using_cached:
+            base_msg = lang.Lang(
+                en="Saved Joint [{0}] does not match '[CharacterName]_Hips'.\nAre you sure you want to start with this joint?",
+                ja=u"記憶ジョイント [{0}] は「[キャラ名等]_Hips」になっていません。\nこのまま修正を開始してよろしいですか？",
+            ).output().format(disp_names)
+        else:
+            base_msg = lang.Lang(
+                en="Joint to remember [{0}] does not match '[CharacterName]_Hips'.\nDo you want to continue and save this joint?",
+                ja=u"記憶ジョイントに登録しようとしている [{0}] は「[キャラ名]_Hips」になっていません。\nこのまま続行してよろしいですか？",
+            ).output().format(disp_names)
+
+        if hips_short:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("SIWeightEditor Improve")
+            box.setText(
+                base_msg
+                + lang.Lang(
+                    en="\n\nFound Hips joint in the same skeleton: {0}",
+                    ja=u"\n\n同じスケルトン内に「{0}」が見つかりました。",
+                ).output().format(hips_short)
+            )
+            use_hips_btn = box.addButton(
+                lang.Lang(
+                    en="Use {0} & Continue",
+                    ja=u"{0} を記憶して続行",
+                ).output().format(hips_short),
+                QMessageBox.AcceptRole,
+            )
+            keep_btn = box.addButton(
+                lang.Lang(
+                    en="Continue As Is",
+                    ja=u"このまま続行",
+                ).output(),
+                QMessageBox.YesRole,
+            )
+            cancel_btn = box.addButton(
+                lang.Lang(en="Cancel", ja=u"キャンセル").output(),
+                QMessageBox.RejectRole,
+            )
+            box.setDefaultButton(use_hips_btn)
+            box.exec_() if hasattr(box, "exec_") else box.exec()
+            clicked = box.clickedButton()
+            if clicked is use_hips_btn:
+                return [hips_candidate]
+            if clicked is keep_btn:
+                return list(joints)
+            return None
+
+        ans = QMessageBox.warning(
+            self,
+            "SIWeightEditor Improve",
+            base_msg,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return list(joints) if ans == QMessageBox.Yes else None
+
     def start_modeling_selected(self):
-        """選択メッシュまたはジョイントに紐づくスキニングメッシュを JSON 記録し、解除・フリーズする。"""
+        """選択メッシュ・ジョイント（または記憶済みジョイント）に紐づくスキニングメッシュを JSON 記録し、解除・フリーズする。"""
         meshes = self._get_selected_polygon_transforms()
         sel_joints = cmds.ls(sl=True, type="joint", long=True) or []
         seed_nodes = list(meshes) + list(sel_joints)
+        used_cached_joints = False
+
+        # 未選択時（またはメッシュ・ジョイント以外を選択中）は一時保存されたジョイントを自動使用する
+        if not seed_nodes and self._cached_joints:
+            resolved_cached = _resolve_cached_joints(self._cached_joints)
+            if resolved_cached:
+                confirmed_cached = self._confirm_non_hips_saved_joint(resolved_cached, is_using_cached=True)
+                if confirmed_cached is None:
+                    self._set_status(
+                        lang.Lang(
+                            en="Cancelled because saved joint is not '[CharacterName]_Hips'.",
+                            ja=u"記憶ジョイントが [キャラ名]_Hips ではないため開始を中止しました。",
+                        ).output(),
+                        error=True,
+                    )
+                    return
+                if confirmed_cached != resolved_cached:
+                    self._cached_joints = _save_last_seed_joints(confirmed_cached)
+                    self._update_cached_joint_ui()
+                seed_nodes = confirmed_cached
+                sel_joints = confirmed_cached
+                used_cached_joints = True
 
         if not seed_nodes:
             self._set_status(
@@ -1524,71 +3099,148 @@ class ModelEditWindow(qt.SubWindow):
         if not target_meshes:
             self._set_status(
                 lang.Lang(
-                    en="No skinned meshes found for the current selection.",
-                    ja=u"選択対象に紐づくスキニング済みメッシュが見つかりませんでした。",
+                    en="No skinned meshes found for the current selection or saved joint.",
+                    ja=u"選択対象または記憶ジョイントに紐づくスキニング済みメッシュが見つかりませんでした。",
                 ).output(),
                 error=True,
             )
             return
 
+        # 2 回目以降に未選択でも開始できるよう、今回使用したジョイントを一時保存する
+        joints_to_remember = []
+        if sel_joints and not used_cached_joints:
+            joints_to_remember = list(sel_joints)
+        elif not used_cached_joints:
+            for mesh_long in target_meshes:
+                sc = _get_skin_cluster(mesh_long)
+                if sc:
+                    infs = cmds.ls(cmds.skinCluster(sc, q=True, inf=True) or [], type="joint", long=True) or []
+                    if infs:
+                        joints_to_remember = [infs[0]]
+                        break
+        if joints_to_remember:
+            confirmed_remember = self._confirm_non_hips_saved_joint(joints_to_remember, is_using_cached=False)
+            if confirmed_remember is None:
+                self._set_status(
+                    lang.Lang(
+                        en="Cancelled because joint to save is not '[CharacterName]_Hips'.",
+                        ja=u"記憶ジョイントが [キャラ名]_Hips ではないため開始を中止しました。",
+                    ).output(),
+                    error=True,
+                )
+                return
+            self._cached_joints = _save_last_seed_joints(confirmed_remember)
+            self._update_cached_joint_ui()
+
         saved_frame = None
         edit_frame = None
-        if self.restore_frame_chk.isChecked():
-            try:
-                saved_frame = float(cmds.currentTime(query=True))
-                edit_frame = float(self.edit_frame_spin.value())
-                self._saved_frame = saved_frame
-                if abs(saved_frame - edit_frame) > 1e-6:
-                    cmds.currentTime(edit_frame, edit=True)
-            except Exception as exc:
-                print("ModelEdit frame switch warning:", exc)
-
-        if self.bind_pose_chk.isChecked():
-            try:
-                cmds.select(target_meshes, replace=True)
-                mel.eval("gotoBindPose;")
-            except Exception:
-                pass
-
+        bind_pose_skipped_reason = None
+        drifted_bones = []
         saved_paths = []
         started_names = []
-        cmds.undoInfo(openChunk=True)
+
+        prev_autokey = self._disable_auto_keyframe_temporarily()
         try:
-            cmds.selectMode(object=True)
-            for mesh_long in target_meshes:
-                save_path, payload = export_mesh_skin_json(
-                    mesh_long,
-                    saved_frame=saved_frame,
-                    edit_frame=edit_frame,
+            if self.restore_frame_chk.isChecked():
+                try:
+                    saved_frame = float(cmds.currentTime(query=True))
+                    edit_frame = float(self.edit_frame_spin.value())
+                    self._saved_frame = saved_frame
+                    if abs(saved_frame - edit_frame) > 1e-6:
+                        cmds.currentTime(edit_frame, edit=True)
+                except Exception as exc:
+                    print("ModelEdit frame switch warning:", exc)
+
+            cmds.undoInfo(openChunk=True, chunkName="SIWE_StartModelEdit")
+            try:
+                if self.bind_pose_chk.isChecked():
+                    pose_info = self._inspect_skeleton_rotation_state(target_meshes, edit_frame)
+                    # 基準フレームに回転キーがある、または既に全ボーン Rotate=(0,0,0) の場合は古い dagPose による回転汚染を防ぐためスキップする
+                    if edit_frame is not None and (pose_info["keyed_at_edit_frame"] > 0 or pose_info["all_zero_rot"]):
+                        if pose_info["keyed_at_edit_frame"] > 0:
+                            bind_pose_skipped_reason = lang.Lang(
+                                en="Skipped gotoBindPose (frame {0} has rotation keyframes on {1} joint(s); protected from dagPose drift)",
+                                ja=u"gotoBindPose をスキップ（{0} フレームに回転キー {1} 本を検出：古い dagPose による回転混入を防止）",
+                            ).output().format(_format_frame_value(edit_frame), pose_info["keyed_at_edit_frame"])
+                        else:
+                            bind_pose_skipped_reason = lang.Lang(
+                                en="Skipped gotoBindPose (all joints already at Rotate=(0,0,0) on frame {0})",
+                                ja=u"gotoBindPose をスキップ（{0} フレームの全ボーン回転が既に 0,0,0 の A ポーズのため保護）",
+                            ).output().format(_format_frame_value(edit_frame))
+                    else:
+                        try:
+                            cmds.select(target_meshes, replace=True)
+                            mel.eval("gotoBindPose;")
+                            drifted_bones = self._sanitize_rotations_after_bind_pose(pose_info["pre_rot_map"])
+                        except Exception:
+                            pass
+                cmds.selectMode(object=True)
+                for mesh_long in target_meshes:
+                    save_path, payload = export_mesh_skin_json(
+                        mesh_long,
+                        saved_frame=saved_frame,
+                        edit_frame=edit_frame,
+                    )
+                    _detach_and_freeze_for_modeling(mesh_long)
+                    saved_paths.append(save_path)
+                    started_names.append("{0}({1}vtx)".format(payload["mesh_short"], payload["vertex_count"]))
+                cmds.select(target_meshes, replace=True)
+            except Exception as exc:
+                self._set_status(
+                    lang.Lang(en="Error: {0}", ja=u"エラー: {0}").output().format(exc),
+                    error=True,
                 )
-                _detach_and_freeze_for_modeling(mesh_long)
-                saved_paths.append(save_path)
-                started_names.append("{0}({1}vtx)".format(payload["mesh_short"], payload["vertex_count"]))
-            cmds.select(target_meshes, replace=True)
-        except Exception as exc:
-            self._set_status("Error: {0}".format(exc), error=True)
-            raise
+                raise
+            finally:
+                cmds.undoInfo(closeChunk=True)
         finally:
-            cmds.undoInfo(closeChunk=True)
+            self._restore_auto_keyframe_state(prev_autokey)
 
         self.reload_record_list(select_paths=saved_paths)
         short_msg = lang.Lang(
             en="Ready ({0} mesh(es)): Weights recorded & unbound.",
-            ja=u"編集開始（{0} メッシュ）：ウェイト記録・解除完了。",
+            ja=u"修正開始（{0} メッシュ）：ウェイト記録・解除完了。",
         ).output().format(len(started_names))
+        if used_cached_joints:
+            short_msg += lang.Lang(
+                en=" | From saved joint",
+                ja=u" ｜ 記憶ジョイント使用",
+            ).output()
         if saved_frame is not None and edit_frame is not None:
             short_msg += lang.Lang(
                 en=" | Frame: {0} -> {1}",
                 ja=u" ｜ フレーム: {0} → {1}",
             ).output().format(_format_frame_value(saved_frame), _format_frame_value(edit_frame))
         detail_lines = []
+        if used_cached_joints and self._cached_joints:
+            detail_lines.append(
+                lang.Lang(
+                    en="Auto-started from saved joint: {0}",
+                    ja=u"記憶ジョイントから自動開始: {0}",
+                ).output().format(", ".join(j.split("|")[-1] for j in self._cached_joints[:5]))
+            )
         if saved_frame is not None and edit_frame is not None:
             detail_lines.append(
-                u"フレーム移動: {0} → {1}（完了後に {0} へ復帰）".format(
+                lang.Lang(
+                    en="Frame switched: {0} -> {1} (will restore to {0} on finish)",
+                    ja=u"フレーム移動: {0} → {1}（完了後に {0} へ復帰）",
+                ).output().format(
                     _format_frame_value(saved_frame), _format_frame_value(edit_frame)
                 )
             )
-        detail_lines.append(u"対象メッシュ一覧:")
+        if bind_pose_skipped_reason:
+            detail_lines.append(bind_pose_skipped_reason)
+        if drifted_bones:
+            detail_lines.append(
+                lang.Lang(
+                    en="Warning: gotoBindPose changed rotation on {0} joint(s): {1}",
+                    ja=u"注意: gotoBindPose により回転が変化したボーン ({0} 本): {1}",
+                ).output().format(
+                    len(drifted_bones),
+                    ", ".join("{0}({1:.2f},{2:.2f},{3:.2f})".format(n, r[0], r[1], r[2]) for n, r in drifted_bones[:8]),
+                )
+            )
+        detail_lines.append(lang.Lang(en="Target meshes:", ja=u"対象メッシュ一覧:").output())
         for item_name in started_names:
             detail_lines.append("  " + item_name)
         detail_msg = "\n".join(detail_lines)
@@ -1641,7 +3293,10 @@ class ModelEditWindow(qt.SubWindow):
                 error=False,
             )
         except Exception as exc:
-            self._set_status("Delete error: {0}".format(exc), error=True)
+            self._set_status(
+                lang.Lang(en="Delete error: {0}", ja=u"削除エラー: {0}").output().format(exc),
+                error=True,
+            )
 
     def finish_modeling_selected(self, use_viewport_mesh=False):
         """修正後のメッシュをフリーズ・再バインドし、JSON からウェイトを復元・補間適用する。"""
@@ -1668,7 +3323,7 @@ class ModelEditWindow(qt.SubWindow):
                 return
             pairs.append((recs[0], meshes[0]))
         else:
-            # 編集完了ボタンでは一覧に記録されている全メッシュ（シーン内に存在するもの）を一括復元する
+            # 修正完了ボタンでは一覧に記録されている全メッシュ（シーン内に存在するもの）を一括復元する
             self.reload_record_list()
             if not self._records:
                 self._set_status(
@@ -1694,7 +3349,7 @@ class ModelEditWindow(qt.SubWindow):
                         ja=u"現在のシーンに該当するメッシュが見つかりませんでした（未検出: {0} 件）。",
                     ).output().format(len(missing_meshes)),
                     error=True,
-                    detail=u"未検出メッシュ:\n  " + "\n  ".join(missing_meshes),
+                    detail=lang.Lang(en="Missing meshes:\n  ", ja=u"未検出メッシュ:\n  ").output() + "\n  ".join(missing_meshes),
                 )
                 return
 
@@ -1704,74 +3359,81 @@ class ModelEditWindow(qt.SubWindow):
         use_frame_restore = self.restore_frame_chk.isChecked()
         edit_frame = float(self.edit_frame_spin.value())
 
-        # 再バインドは必ず基準（0）フレーム上で実行し、仮ポーズのままバインドされる事故を防ぐ
-        if use_frame_restore:
-            try:
-                cur_frame = float(cmds.currentTime(query=True))
-                if abs(cur_frame - edit_frame) > 1e-6:
-                    cmds.currentTime(edit_frame, edit=True)
-            except Exception as exc:
-                print("ModelEdit pre-restore frame switch warning:", exc)
-
         restored_paths = []
         restored_meshes = []
         summaries = []
         total_missing_bones = 0
         max_moved_joints = 0
         saved_frame_to_restore = None
-
-        cmds.undoInfo(openChunk=True)
-        try:
-            cmds.selectMode(object=True)
-            for rec, target_mesh in pairs:
-                with open(rec["path"], "r") as fp:
-                    payload = json.load(fp)
-                if saved_frame_to_restore is None and payload.get("saved_frame") is not None:
-                    saved_frame_to_restore = float(payload["saved_frame"])
-                result = finish_modeling_and_restore(
-                    target_mesh,
-                    payload,
-                    restore_mode=restore_mode,
-                    smooth_iters=smooth_iters,
-                    clean_orphaned_bind_pose=clean_bind_pose,
-                )
-                payload["status"] = "restored"
-                with open(rec["path"], "w") as fp:
-                    json.dump(payload, fp)
-
-                restored_paths.append(rec["path"])
-                restored_meshes.append(target_mesh)
-                total_missing_bones += len(result["missing_infs"])
-                max_moved_joints = max(max_moved_joints, int(result.get("moved_joints", 0)))
-
-                m_tag = u"Idx" if result["method"] == "index" else u"Surf"
-                summaries.append(
-                    "{0} ({1}->{2} / {3})".format(
-                        target_mesh.split("|")[-1],
-                        result["orig_vtx_count"],
-                        result["new_vtx_count"],
-                        m_tag,
-                    )
-                )
-            if restored_meshes:
-                cmds.select(restored_meshes, replace=True)
-        except Exception as exc:
-            self._set_status("Restore error: {0}".format(exc), error=True)
-            raise
-        finally:
-            cmds.undoInfo(closeChunk=True)
-
-        # 全メッシュのウェイト復元完了後、事前に記録した元フレームへ復帰する
         restored_frame_val = None
-        if use_frame_restore:
-            if saved_frame_to_restore is None:
-                saved_frame_to_restore = self._saved_frame
-            if saved_frame_to_restore is not None:
+
+        prev_autokey = self._disable_auto_keyframe_temporarily()
+        try:
+            # 再バインドは必ず基準（0）フレーム上で実行し、仮ポーズのままバインドされる事故を防ぐ
+            if use_frame_restore:
                 try:
-                    cmds.currentTime(saved_frame_to_restore, edit=True)
-                    restored_frame_val = saved_frame_to_restore
+                    cur_frame = float(cmds.currentTime(query=True))
+                    if abs(cur_frame - edit_frame) > 1e-6:
+                        cmds.currentTime(edit_frame, edit=True)
                 except Exception as exc:
-                    print("ModelEdit restore frame warning:", exc)
+                    print("ModelEdit pre-restore frame switch warning:", exc)
+
+            cmds.undoInfo(openChunk=True, chunkName="SIWE_FinishModelEdit")
+            try:
+                cmds.selectMode(object=True)
+                for rec, target_mesh in pairs:
+                    with open(rec["path"], "r") as fp:
+                        payload = json.load(fp)
+                    if saved_frame_to_restore is None and payload.get("saved_frame") is not None:
+                        saved_frame_to_restore = float(payload["saved_frame"])
+                    result = finish_modeling_and_restore(
+                        target_mesh,
+                        payload,
+                        restore_mode=restore_mode,
+                        smooth_iters=smooth_iters,
+                        clean_orphaned_bind_pose=clean_bind_pose,
+                    )
+                    payload["status"] = "restored"
+                    with open(rec["path"], "w") as fp:
+                        json.dump(payload, fp)
+
+                    restored_paths.append(rec["path"])
+                    restored_meshes.append(target_mesh)
+                    total_missing_bones += len(result["missing_infs"])
+                    max_moved_joints = max(max_moved_joints, int(result.get("moved_joints", 0)))
+
+                    m_tag = u"Idx" if result["method"] == "index" else u"Surf"
+                    summaries.append(
+                        "{0} ({1}->{2} / {3})".format(
+                            target_mesh.split("|")[-1],
+                            result["orig_vtx_count"],
+                            result["new_vtx_count"],
+                            m_tag,
+                        )
+                    )
+                if restored_meshes:
+                    cmds.select(restored_meshes, replace=True)
+            except Exception as exc:
+                self._set_status(
+                    lang.Lang(en="Restore error: {0}", ja=u"復元エラー: {0}").output().format(exc),
+                    error=True,
+                )
+                raise
+            finally:
+                cmds.undoInfo(closeChunk=True)
+
+            # 全メッシュのウェイト復元完了後、事前に記録した元フレームへ復帰する
+            if use_frame_restore:
+                if saved_frame_to_restore is None:
+                    saved_frame_to_restore = self._saved_frame
+                if saved_frame_to_restore is not None:
+                    try:
+                        cmds.currentTime(saved_frame_to_restore, edit=True)
+                        restored_frame_val = saved_frame_to_restore
+                    except Exception as exc:
+                        print("ModelEdit restore frame warning:", exc)
+        finally:
+            self._restore_auto_keyframe_state(prev_autokey)
 
         self.reload_record_list(select_paths=restored_paths)
 
@@ -1803,15 +3465,28 @@ class ModelEditWindow(qt.SubWindow):
         detail_lines = []
         if restored_frame_val is not None:
             detail_lines.append(
-                u"フレーム復帰: {0} → {1}".format(
+                lang.Lang(
+                    en="Frame restored: {0} -> {1}",
+                    ja=u"フレーム復帰: {0} → {1}",
+                ).output().format(
                     _format_frame_value(edit_frame), _format_frame_value(restored_frame_val)
                 )
             )
-        detail_lines.append(u"復元メッシュ一覧 ({0} 件):".format(len(summaries)))
+        detail_lines.append(
+            lang.Lang(
+                en="Restored meshes ({0}):",
+                ja=u"復元メッシュ一覧 ({0} 件):",
+            ).output().format(len(summaries))
+        )
         for item in summaries:
             detail_lines.append("  " + item)
         if missing_meshes:
-            detail_lines.append(u"シーン内に存在しないためスキップ ({0} 件):".format(len(missing_meshes)))
+            detail_lines.append(
+                lang.Lang(
+                    en="Skipped (not found in scene) ({0}):",
+                    ja=u"シーン内に存在しないためスキップ ({0} 件):",
+                ).output().format(len(missing_meshes))
+            )
             for name in missing_meshes:
                 detail_lines.append("  " + name)
         detail_msg = "\n".join(detail_lines)
@@ -1827,6 +3502,201 @@ class ModelEditWindow(qt.SubWindow):
     # ------------------------------------------------------------------
     # タブ 2 ハンドラ：ジョイント整理 ＆ Joint Orient
     # ------------------------------------------------------------------
+    def _install_radius_selection_job(self):
+        """ビューポート選択変更時に選択ジョイントの Radius 値を自動同期する scriptJob を登録する。"""
+        self._remove_radius_selection_job()
+        try:
+            self._radius_script_job_id = cmds.scriptJob(
+                event=["SelectionChanged", self._on_viewport_selection_changed_for_radius],
+                protected=True,
+            )
+        except Exception:
+            self._radius_script_job_id = None
+
+    def _remove_radius_selection_job(self):
+        """登録済みの選択監視 scriptJob を安全に解除する。"""
+        job_id = getattr(self, "_radius_script_job_id", None)
+        if job_id is not None:
+            try:
+                if cmds.scriptJob(exists=job_id):
+                    cmds.scriptJob(kill=job_id, force=True)
+            except Exception:
+                pass
+            self._radius_script_job_id = None
+
+    def _on_viewport_selection_changed_for_radius(self):
+        """Maya の SelectionChanged 通知を受けて Radius UI を現在選択へ同期する。"""
+        if self._radius_undo_open:
+            return
+        try:
+            self._sync_radius_from_selection(show_status=False)
+        except Exception:
+            pass
+
+    def _get_radius_target_joints(self):
+        """Radius 調整の対象となるビューポート選択ジョイント一覧を返す。"""
+        sel_joints = cmds.ls(sl=True, type="joint", long=True) or []
+        if not sel_joints:
+            return []
+        if hasattr(self, "jnt_radius_children_chk") and self.jnt_radius_children_chk.isChecked():
+            return rig_cleanup_helper.collect_target_joints(include_children=True)
+        return sel_joints
+
+    def _sync_radius_from_selection(self, show_status=False):
+        """現在ビューポートで選択中のジョイントから Radius 値を読み取り UI へ反映する。"""
+        if not hasattr(self, "jnt_radius_spin"):
+            return
+        sel_joints = cmds.ls(sl=True, type="joint", long=True) or []
+        if not sel_joints:
+            self.jnt_radius_info_label.setText(
+                lang.Lang(
+                    en="Viewport Selection: No joint selected",
+                    ja=u"ビューポート選択: ジョイント未選択",
+                ).output()
+            )
+            if show_status:
+                self._set_status(
+                    lang.Lang(
+                        en="Select one or more joints in the viewport first.",
+                        ja=u"Radius を取得するジョイントをビューポートで選択してください。",
+                    ).output(),
+                    error=True,
+                )
+            return
+
+        radii = []
+        for jnt in sel_joints:
+            if cmds.attributeQuery("radius", node=jnt, exists=True):
+                try:
+                    radii.append(float(cmds.getAttr(jnt + ".radius")))
+                except Exception:
+                    pass
+        if not radii:
+            return
+
+        val = max(0.01, min(1000.0, radii[0]))
+        is_mixed = any(abs(r - radii[0]) > 1e-4 for r in radii[1:])
+
+        self._radius_syncing = True
+        try:
+            self.jnt_radius_spin.setValue(val)
+            slider_val = int(round(max(0.01, min(10.0, val)) * 100.0))
+            self.jnt_radius_slider.setValue(slider_val)
+        finally:
+            self._radius_syncing = False
+
+        head = sel_joints[0].split("|")[-1]
+        if len(sel_joints) == 1:
+            info_txt = lang.Lang(
+                en="Viewport Selection: {0} (Radius: {1:.2f})",
+                ja=u"ビューポート選択: {0}（Radius: {1:.2f}）",
+            ).output().format(head, val)
+        else:
+            mixed_tag = lang.Lang(en="mixed", ja=u"混在").output() if is_mixed else "{0:.2f}".format(val)
+            info_txt = lang.Lang(
+                en="Viewport Selection: {0} joints ({1} ... | Radius: {2})",
+                ja=u"ビューポート選択: {0} 本（{1} ほか ｜ Radius: {2}）",
+            ).output().format(len(sel_joints), head, mixed_tag)
+        self.jnt_radius_info_label.setText(info_txt)
+
+        if show_status:
+            self._set_status(info_txt, error=False)
+
+    def _apply_radius_to_selection(self, radius_value):
+        """指定した Radius 値をビューポート選択ジョイントへリアルタイム反映する。"""
+        joints = self._get_radius_target_joints()
+        if not joints:
+            self.jnt_radius_info_label.setText(
+                lang.Lang(
+                    en="Viewport Selection: No joint selected",
+                    ja=u"ビューポート選択: ジョイント未選択",
+                ).output()
+            )
+            return
+
+        val = max(0.01, float(radius_value))
+        updated = 0
+        for jnt in joints:
+            if not cmds.objExists(jnt):
+                continue
+            attr = jnt + ".radius"
+            try:
+                if cmds.getAttr(attr, settable=True):
+                    cmds.setAttr(attr, val)
+                    updated += 1
+            except Exception:
+                pass
+
+        head = joints[0].split("|")[-1]
+        if len(joints) == 1:
+            self.jnt_radius_info_label.setText(
+                lang.Lang(
+                    en="Adjusted: {0} -> Radius {1:.2f}",
+                    ja=u"適用中: {0} → Radius {1:.2f}",
+                ).output().format(head, val)
+            )
+        else:
+            self.jnt_radius_info_label.setText(
+                lang.Lang(
+                    en="Adjusted: {0} joint(s) -> Radius {1:.2f}",
+                    ja=u"適用中: {0} 本のジョイント → Radius {1:.2f}",
+                ).output().format(updated, val)
+            )
+
+    def _on_radius_slider_pressed(self):
+        """スライダードラッグ開始時に 1 つの Undo チャンクを開く。"""
+        if not self._radius_undo_open:
+            try:
+                cmds.undoInfo(openChunk=True, chunkName="SIWE_JointRadius")
+                self._radius_undo_open = True
+            except Exception:
+                self._radius_undo_open = False
+
+    def _on_radius_slider_changed(self, int_val):
+        """スライダー移動に応じて数値入力とビューポート選択ジョイントの Radius をリアルタイム更新する。"""
+        if self._radius_syncing:
+            return
+        val = max(0.01, float(int_val) / 100.0)
+        self._radius_syncing = True
+        try:
+            self.jnt_radius_spin.setValue(val)
+        finally:
+            self._radius_syncing = False
+        if self._radius_undo_open:
+            self._apply_radius_to_selection(val)
+        else:
+            with qt.undo_chunk("SIWE_JointRadius"):
+                self._apply_radius_to_selection(val)
+
+    def _on_radius_slider_released(self):
+        """スライダードラッグ終了時に Undo チャンクを閉じる。"""
+        if self._radius_undo_open:
+            try:
+                cmds.undoInfo(closeChunk=True)
+            except Exception:
+                pass
+            self._radius_undo_open = False
+
+    def _on_radius_spin_changed(self, val):
+        """数値入力変更に応じてスライダーと選択ジョイントの Radius をリアルタイム更新する。"""
+        if self._radius_syncing:
+            return
+        self._radius_syncing = True
+        try:
+            slider_val = int(round(max(0.01, min(10.0, float(val))) * 100.0))
+            self.jnt_radius_slider.setValue(slider_val)
+        finally:
+            self._radius_syncing = False
+
+        if self._radius_undo_open:
+            self._apply_radius_to_selection(val)
+        else:
+            cmds.undoInfo(openChunk=True, chunkName="SIWE_JointRadius")
+            try:
+                self._apply_radius_to_selection(val)
+            finally:
+                cmds.undoInfo(closeChunk=True)
+
     def _update_orient_controls_enabled(self, world_checked):
         for widget in self._orient_axis_widgets:
             widget.setEnabled(not world_checked)
@@ -1870,7 +3740,7 @@ class ModelEditWindow(qt.SubWindow):
             j_item.setToolTip(info["joint"])
 
             s_item = QTableWidgetItem(info["summary"])
-            if info["bad_rot"] or info["bad_scl"] or info["bad_ra"]:
+            if info["bad_rot"] or info["bad_scl"] or info["bad_ra"] or info.get("has_conn") or info.get("has_lock"):
                 s_item.setForeground(QColor(255, 190, 95))
             else:
                 s_item.setForeground(QColor(175, 210, 255))
@@ -2072,7 +3942,10 @@ class ModelEditWindow(qt.SubWindow):
                 zero_end_joints=zero_end,
             )
         except Exception as exc:
-            self._set_status("Orient Joint error: {0}".format(exc), error=True)
+            self._set_status(
+                lang.Lang(en="Orient Joint error: {0}", ja=u"Orient Joint エラー: {0}").output().format(exc),
+                error=True,
+            )
             raise
         finally:
             cmds.undoInfo(closeChunk=True)
@@ -2103,7 +3976,8 @@ class ModelEditWindow(qt.SubWindow):
             )
             return
 
-        state = rig_cleanup_helper.toggle_local_axes_visibility(joints)
+        with qt.undo_chunk("SIWE_ToggleLocalAxes"):
+            state = rig_cleanup_helper.toggle_local_axes_visibility(joints)
         label = "ON" if state else "OFF"
         self._set_status(
             lang.Lang(
@@ -2112,6 +3986,99 @@ class ModelEditWindow(qt.SubWindow):
             ).output().format(label, len(joints)),
             error=False,
         )
+
+    def run_freeze_selected_bone_rot_keep_keys(self):
+        """選択ボーンの回転 XYZ を現在値でフリーズして 0 へ戻し、選択ボーンと子ボーンのキーフレームを退避・書き戻す。"""
+        sel_joints = cmds.ls(sl=True, type="joint", long=True) or []
+        if not sel_joints:
+            self._set_status(
+                lang.Lang(
+                    en="Select one or more joints to freeze rotation.",
+                    ja=u"回転をフリーズするジョイントを選択してください。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        base_frame = float(self.freeze_rot_base_frame_spin.value())
+        include_children = self.freeze_rot_children_chk.isChecked()
+
+        with qt.undo_chunk("SIWE_FreezeBoneRotKeepKeys"):
+            try:
+                res = rig_cleanup_helper.freeze_selected_bone_rotation_preserving_keyframes(
+                    selected_joints=sel_joints,
+                    base_storage_dir=_get_storage_dir(),
+                    base_frame=base_frame,
+                    include_children_in_freeze=include_children,
+                )
+            except Exception as exc:
+                self._set_status(
+                    lang.Lang(
+                        en="Bone Rotation Freeze error: {0}",
+                        ja=u"ボーン回転フリーズエラー: {0}",
+                    ).output().format(exc),
+                    error=True,
+                )
+                raise
+
+        short_msg = lang.Lang(
+            en="Frozen Rotate -> 0 on {0} joint(s) (Base F={1} | Keys restored: {2} keys on {3} joint(s)).",
+            ja=u"回転フリーズ完了: {0} 本を 0 へ固定（基準F={1} ｜ キー復元: {3} 本 / {2} キー）",
+        ).output().format(
+            len(res["frozen_joints"]),
+            _format_frame_value(res["base_frame"]),
+            res["restored_keys"],
+            res["restored_joints"],
+        )
+
+        detail_lines = [
+            lang.Lang(
+                en="Base Frame: {0} (frozen joints set to 0 on base frame, frames after base frame restored verbatim)",
+                ja=u"基準フレーム: {0}（フリーズ対象の基準フレーム回転を 0 に固定、それ以降のキー値はそのまま復元）",
+            ).output().format(_format_frame_value(res["base_frame"])),
+            lang.Lang(
+                en="Frozen joints ({0}): {1}",
+                ja=u"回転フリーズ対象 ({0} 本): {1}",
+            ).output().format(
+                len(res["frozen_joints"]),
+                ", ".join(j.split("|")[-1] for j in res["frozen_joints"]),
+            ),
+            lang.Lang(
+                en="Child joints keys preserved ({0}): {1}",
+                ja=u"キー退避・保護した子ボーン ({0} 本): {1}",
+            ).output().format(
+                len(res["child_joints"]),
+                ", ".join(j.split("|")[-1] for j in res["child_joints"][:20])
+                + (u" ..." if len(res["child_joints"]) > 20 else u""),
+            ),
+            lang.Lang(
+                en="Restored keyframes: {0} keys across {1} joint(s) (base-frame zeroed channels: {2})",
+                ja=u"書き戻しキー数: {1} 本 / 合計 {0} キー（基準フレーム 0 固定チャネル: {2}）",
+            ).output().format(
+                res["restored_keys"],
+                res["restored_joints"],
+                res["zeroed_base_keys"],
+            ),
+        ]
+        if res.get("skipped_joints"):
+            detail_lines.append(
+                lang.Lang(
+                    en="Skipped joints ({0}): {1}",
+                    ja=u"スキップしたジョイント ({0} 本): {1}",
+                ).output().format(
+                    len(res["skipped_joints"]),
+                    ", ".join(j.split("|")[-1] for j in res["skipped_joints"]),
+                )
+            )
+        if res.get("backup_path"):
+            detail_lines.append(
+                lang.Lang(
+                    en="Keyframe backup JSON: {0}",
+                    ja=u"キーフレーム退避 JSON: {0}",
+                ).output().format(res["backup_path"])
+            )
+
+        self._set_status(short_msg, error=False, detail="\n".join(detail_lines))
 
     def run_tweak_orient(self, axis, degrees):
         """選択ジョイント自身のローカル軸を子位置維持で回転微調整する。"""
@@ -2138,6 +4105,1201 @@ class ModelEditWindow(qt.SubWindow):
             ).output().format(axis, degrees, len(updated)),
             error=False,
         )
+
+    def open_unweighted_bind_window(self):
+        """ウェイトが入っていないメッシュ一覧と割り当て先ボーン一覧の専用ウィンドウを開く。"""
+        if self.unweighted_bind_window is not None:
+            try:
+                self.unweighted_bind_window.refresh_lists(apply_viewport_selection=True)
+                self.unweighted_bind_window.show()
+                self.unweighted_bind_window.raise_()
+                self.unweighted_bind_window.activateWindow()
+                return
+            except Exception:
+                self.unweighted_bind_window = None
+
+        self.unweighted_bind_window = unweighted_bind_window.UnweightedMeshBindWindow(
+            owner_window=self,
+            editor_window=self.editor,
+        )
+        self.unweighted_bind_window.show()
+
+    def run_safe_bind_selected_joints(self):
+        """選択ジョイント（必要に応じて子階層含む）を既存ウェイトを維持したまま安全にバインドする。"""
+        include_children = self.safe_bind_children_chk.isChecked()
+        target_joints = rig_cleanup_helper.collect_target_joints(include_children=include_children)
+        if not target_joints:
+            self._set_status(
+                lang.Lang(
+                    en="Select one or more joints to bind (mesh selection is optional).",
+                    ja=u"バインドするジョイントをビューポートまたはアウトライナーで選択してください（メッシュは未選択でも自動検出されます）。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        selected_meshes = self._get_selected_polygon_transforms()
+        mode = self.safe_bind_mode_combo.currentData() or "mirror_opposite"
+        unlock_added = self.safe_bind_unlock_chk.isChecked()
+
+        with qt.undo_chunk("SIWE_SafeBindJoints"):
+            try:
+                res = rig_cleanup_helper.safe_bind_joints_to_meshes(
+                    target_joints=target_joints,
+                    target_meshes=selected_meshes or None,
+                    mode=mode,
+                    unlock_added=unlock_added,
+                )
+            except Exception as exc:
+                self._set_status(
+                    lang.Lang(en="Safe Bind error: {0}", ja=u"安全バインドエラー: {0}").output().format(exc),
+                    error=True,
+                )
+                return
+
+        added_cnt = len(res["added_influences"])
+        vtx_cnt = int(res["weighted_vertices"])
+        mesh_cnt = len(res["meshes"])
+        pair_cnt = len(res["matched_pairs"])
+        new_mesh_cnt = len(res["newly_bound_meshes"])
+
+        if new_mesh_cnt > 0 and added_cnt == 0 and vtx_cnt == 0:
+            short_msg = lang.Lang(
+                en="Bound {0} joint(s) to {1} unbound mesh(es).",
+                ja=u"新規バインド完了 ｜ ジョイント:{0} 本 / メッシュ:{1} 件",
+            ).output().format(len(res["target_joints"]), new_mesh_cnt)
+        elif mode == "mirror_opposite":
+            short_msg = lang.Lang(
+                en="Safe Bind (Mirror) done | Meshes:{0} AddedInf:{1} Pairs:{2} MirroredVtx:{3}",
+                ja=u"安全バインド（ミラー）完了 ｜ メッシュ:{0} / 追加:{1} 本 / 左右対:{2} / 転写頂点:{3}",
+            ).output().format(mesh_cnt, added_cnt, pair_cnt, vtx_cnt)
+        elif mode == "auto_bind_new":
+            short_msg = lang.Lang(
+                en="Safe Bind (Auto) done | Meshes:{0} AddedInf:{1} WeightedVtx:{2}",
+                ja=u"安全バインド（近傍自動）完了 ｜ メッシュ:{0} / 追加:{1} 本 / 割当頂点:{2}",
+            ).output().format(mesh_cnt, added_cnt, vtx_cnt)
+        else:
+            short_msg = lang.Lang(
+                en="Safe Add Influence done | Meshes:{0} AddedInf:{1} (weight=0)",
+                ja=u"安全インフルエンス追加完了 ｜ メッシュ:{0} / 追加:{1} 本（既存ウェイト維持）",
+            ).output().format(mesh_cnt, added_cnt)
+
+        detail_lines = [
+            lang.Lang(en="Target Joints ({0}):", ja=u"対象ジョイント ({0} 本):").output().format(len(res["target_joints"])),
+            "  " + ", ".join(j.split("|")[-1] for j in res["target_joints"][:30]),
+            lang.Lang(en="Target Meshes ({0}):", ja=u"対象メッシュ ({0} 件):").output().format(mesh_cnt),
+            "  " + ", ".join(m.split("|")[-1] for m in res["meshes"]),
+        ]
+        if res["matched_pairs"]:
+            detail_lines.append(
+                lang.Lang(en="Matched Opposite Pairs:", ja=u"検出した左右対応ペア:").output()
+            )
+            for src_j, dst_j in res["matched_pairs"][:30]:
+                detail_lines.append("  {0} -> {1}".format(src_j.split("|")[-1], dst_j.split("|")[-1]))
+        elif mode == "mirror_opposite" and new_mesh_cnt == 0:
+            detail_lines.append(
+                lang.Lang(
+                    en="Note: No weighted opposite bone found. Added influence with weight 0.0 (existing weights untouched). Try 'Auto-Bind Nearby Vertices' if the bone is not symmetric.",
+                    ja=u"補足：対応する反対側ボーン（ウェイトあり）が見つからなかったため、インフルエンス追加（wt=0）のみ行いました。左右非対称ボーンの場合は「近傍の自動バインド」モードをお試しください。",
+                ).output()
+            )
+
+        self._set_status(short_msg, error=False, detail="\n".join(detail_lines))
+
+        # SIWeightEditor 本体の表示も最新状態へ同期する
+        if self.editor is not None and not getattr(self.editor, "closed_flag", False):
+            try:
+                self.editor.get_set_skin_weight(cycle=True)
+                self.editor.set_message(msg="- " + short_msg + " -", error=False)
+            except Exception:
+                pass
+
+    def _run_mirror_common(self, dry_run=False):
+        """高精度スキンウェイト・ミラーの実行または診断プレビューを共通処理する。"""
+        direction = self.mirror_dir_combo.currentData() or "auto"
+        plane = self.mirror_plane_combo.currentData() or "YZ"
+        sample_mode = self.mirror_sample_combo.currentData() or "auto"
+        include_children = self.mirror_children_chk.isChecked()
+        auto_add = self.mirror_auto_add_chk.isChecked()
+        equalize_center = self.mirror_center_eq_chk.isChecked()
+        pos_fallback = self.mirror_pos_fallback_chk.isChecked()
+
+        try:
+            if dry_run:
+                res = weight_mirror_copy_helper.execute_precision_weight_mirror(
+                    direction=direction,
+                    plane=plane,
+                    sample_mode=sample_mode,
+                    include_children=include_children,
+                    auto_add_opposite=auto_add,
+                    equalize_center=equalize_center,
+                    use_position_fallback=pos_fallback,
+                    dry_run=True,
+                )
+            else:
+                with qt.undo_chunk("SIWE_PrecisionWeightMirror"):
+                    res = weight_mirror_copy_helper.execute_precision_weight_mirror(
+                        direction=direction,
+                        plane=plane,
+                        sample_mode=sample_mode,
+                        include_children=include_children,
+                        auto_add_opposite=auto_add,
+                        equalize_center=equalize_center,
+                        use_position_fallback=pos_fallback,
+                        dry_run=False,
+                    )
+        except Exception as exc:
+            self._set_status(
+                lang.Lang(en="Weight Mirror error: {0}", ja=u"ウェイトミラーエラー: {0}").output().format(exc),
+                error=True,
+            )
+            return
+
+        mode_labels = {
+            "bone_mirror": lang.Lang(en="Bone", ja=u"ボーン指定").output(),
+            "single_mesh_mirror": lang.Lang(en="Mesh", ja=u"メッシュ全体").output(),
+            "multi_mesh_mirror": lang.Lang(en="Multi-Mesh", ja=u"別メッシュ間").output(),
+            "component_mirror": lang.Lang(en="Vertices", ja=u"選択頂点").output(),
+        }
+        mode_txt = mode_labels.get(res["mode"], res["mode"])
+        name_cnt = len(res["name_pairs"])
+        pos_cnt = len(res["pos_pairs"])
+        added_cnt = len(res["added_influences"])
+        unm_cnt = len(res["unmatched_sided"])
+
+        if dry_run:
+            short_msg = lang.Lang(
+                en="Mirror Check [{0}] | Meshes:{1} NamePairs:{2} PosPairs:{3} AutoAdd:{4} Unmatched:{5}",
+                ja=u"ミラー診断 [{0}] ｜ メッシュ:{1} / 名前対:{2} / 位置対:{3} / 自動追加予定:{4} / 未対:{5}",
+            ).output().format(mode_txt, len(res["meshes"]), name_cnt, pos_cnt, added_cnt, unm_cnt)
+        else:
+            short_msg = lang.Lang(
+                en="Mirror Done [{0}] | Meshes:{1} MirroredVtx:{2} AddedInf:{3}",
+                ja=u"高精度ミラー完了 [{0}] ｜ メッシュ:{1} / 転写頂点:{2} / 追加ボーン:{3}",
+            ).output().format(mode_txt, len(res["meshes"]), res["mirrored_vertices"], added_cnt)
+
+        detail_lines = [
+            lang.Lang(en="Mode: {0} / Plane: {1}", ja=u"モード: {0} / 対称面: {1}").output().format(mode_txt, plane),
+            lang.Lang(en="Meshes ({0}):", ja=u"対象メッシュ ({0} 件):").output().format(len(res["meshes"])),
+            "  " + ", ".join(m.split("|")[-1] for m in res["meshes"]),
+        ]
+        if res.get("source_bones") and res.get("target_bones"):
+            detail_lines.append(
+                lang.Lang(en="Bone Mirror Direction:", ja=u"ボーン転写方向:").output()
+            )
+            for sj, tj in zip(res["source_bones"][:20], res["target_bones"][:20]):
+                detail_lines.append("  {0} -> {1}".format(sj.split("|")[-1], tj.split("|")[-1]))
+        if res["pos_pairs"]:
+            detail_lines.append(
+                lang.Lang(en="Matched by Position ({0}):", ja=u"3D 座標フォールバック照合 ({0} 組):").output().format(pos_cnt)
+            )
+            for j1, j2 in res["pos_pairs"][:20]:
+                detail_lines.append("  {0} <-> {1}".format(j1.split("|")[-1], j2.split("|")[-1]))
+        if res["added_influences"]:
+            detail_lines.append(
+                lang.Lang(en="Added Opposite Bones ({0}):", ja=u"自動追加ボーン ({0} 本):").output().format(added_cnt)
+            )
+            detail_lines.append("  " + ", ".join(j.split("|")[-1] for j in res["added_influences"][:30]))
+        if res["unmatched_sided"]:
+            detail_lines.append(
+                lang.Lang(en="Unmatched Sided Bones ({0}):", ja=u"反対側が見つからなかった非中央ボーン ({0} 本):").output().format(unm_cnt)
+            )
+            detail_lines.append("  " + ", ".join(j.split("|")[-1] for j in res["unmatched_sided"][:30]))
+
+        self._set_status(short_msg, error=False, detail="\n".join(detail_lines))
+        if not dry_run and self.editor is not None and not getattr(self.editor, "closed_flag", False):
+            try:
+                self.editor.get_set_skin_weight(cycle=True)
+                self.editor.set_message(msg="- " + short_msg + " -", error=False)
+            except Exception:
+                pass
+
+    def run_precision_weight_mirror(self):
+        """高精度スキンウェイト・ミラーを実行する。"""
+        self._run_mirror_common(dry_run=False)
+
+    def run_diagnose_weight_mirror(self):
+        """ミラー実行前に対応ボーンペアや自動追加予定ボーンを非破壊で診断する。"""
+        self._run_mirror_common(dry_run=True)
+
+    def register_weight_copy_source(self):
+        """選択中のスキニング済みメッシュをウェイトコピー元として登録する。"""
+        meshes = self._get_selected_polygon_transforms()
+        if not meshes:
+            self._set_status(
+                lang.Lang(
+                    en="Select a skinned polygon mesh to register as Copy Source.",
+                    ja=u"コピー元にするスキニング済みポリゴンメッシュを 1 つ選択してください。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        src_mesh = meshes[0]
+        if not _get_skin_cluster(src_mesh):
+            self._set_status(
+                lang.Lang(
+                    en="Selected mesh has no skinCluster: {0}",
+                    ja=u"選択メッシュにスキンクラスタがありません: {0}",
+                ).output().format(src_mesh.split("|")[-1]),
+                error=True,
+            )
+            return
+
+        self._weight_copy_src_mesh = src_mesh
+        short_n = src_mesh.split("|")[-1]
+        self.copy_src_label.setText(
+            lang.Lang(en="Source Mesh: {0}", ja=u"コピー元: {0}").output().format(short_n)
+        )
+        self.copy_src_label.setToolTip(src_mesh)
+        self._set_status(
+            lang.Lang(
+                en="Registered weight copy source: {0}",
+                ja=u"ウェイトコピー元を登録しました: {0}（コピー先のメッシュまたは頂点を選んで実行してください）",
+            ).output().format(short_n),
+            error=False,
+        )
+
+    def clear_weight_copy_source(self):
+        """登録中のウェイトコピー元メッシュをクリアする。"""
+        self._weight_copy_src_mesh = None
+        self.copy_src_label.setText(
+            lang.Lang(
+                en="Source Mesh: (Not set - or select Source -> Target meshes directly)",
+                ja=u"コピー元: 未登録（または コピー元 → コピー先 の順に 2 メッシュ直接選択でも可）",
+            ).output()
+        )
+        self.copy_src_label.setToolTip("")
+        self._set_status(
+            lang.Lang(en="Cleared weight copy source.", ja=u"ウェイトコピー元の登録をクリアしました。").output(),
+            error=False,
+        )
+
+    def run_safe_weight_copy(self):
+        """コピー元メッシュから選択メッシュ（または選択頂点群）へ安全かつ高精度にウェイトをコピーする。"""
+        sel_meshes = self._get_selected_polygon_transforms()
+        comp_vtx_map = weight_mirror_copy_helper._collect_selection_components_by_mesh()
+
+        src_mesh = self._weight_copy_src_mesh
+        if src_mesh and not cmds.objExists(src_mesh):
+            src_mesh = None
+            self.clear_weight_copy_source()
+
+        dst_meshes = []
+        dst_vtx_map = None
+
+        if src_mesh:
+            if comp_vtx_map:
+                dst_vtx_map = comp_vtx_map
+            else:
+                dst_meshes = [m for m in sel_meshes if m != src_mesh]
+        else:
+            if len(sel_meshes) >= 2:
+                src_mesh = sel_meshes[0]
+                dst_meshes = sel_meshes[1:]
+            else:
+                self._set_status(
+                    lang.Lang(
+                        en="Register a Source Mesh first, or select Source -> Target meshes (2+) together.",
+                        ja=u"先にコピー元を登録するか、「コピー元 → コピー先」の順に 2 つ以上のメッシュを選択してください。",
+                    ).output(),
+                    error=True,
+                )
+                return
+
+        if not dst_meshes and not dst_vtx_map:
+            self._set_status(
+                lang.Lang(
+                    en="Select target mesh(es) or target vertices to copy weights to.",
+                    ja=u"コピー先のメッシュまたは頂点を選択してください。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        copy_mode = self.copy_mode_combo.currentData() or "auto"
+        mirror = self.copy_mirror_chk.isChecked()
+        plane = self.mirror_plane_combo.currentData() or "YZ"
+        auto_bind = self.copy_auto_bind_chk.isChecked()
+        pos_fallback = self.mirror_pos_fallback_chk.isChecked()
+
+        with qt.undo_chunk("SIWE_SafeWeightCopy"):
+            try:
+                res = weight_mirror_copy_helper.execute_safe_weight_copy(
+                    src_mesh=src_mesh,
+                    dst_meshes=dst_meshes,
+                    dst_vtx_map=dst_vtx_map,
+                    copy_mode=copy_mode,
+                    mirror=mirror,
+                    plane=plane,
+                    auto_bind=auto_bind,
+                    use_position_fallback=pos_fallback,
+                )
+            except Exception as exc:
+                self._set_status(
+                    lang.Lang(en="Weight Copy error: {0}", ja=u"ウェイトコピーエラー: {0}").output().format(exc),
+                    error=True,
+                )
+                return
+
+        tag = lang.Lang(en="Mirrored Copy", ja=u"ミラーコピー").output() if mirror else lang.Lang(en="Copy", ja=u"コピー").output()
+        short_msg = lang.Lang(
+            en="Weight {0} Done | Src:{1} -> Dst:{2} mesh(es) | Verts:{3} | Bound:{4} AddedInf:{5}",
+            ja=u"ウェイト{0}完了 ｜ {1} → {2} メッシュ / 転写頂点:{3} / 新規バインド:{4} / 追加ボーン:{5}",
+        ).output().format(
+            tag,
+            src_mesh.split("|")[-1],
+            len(res["dst_meshes"]),
+            res["copied_vertices"],
+            len(res["newly_bound_meshes"]),
+            len(res["added_influences"]),
+        )
+        detail_lines = [
+            lang.Lang(en="Source: {0}", ja=u"コピー元: {0}").output().format(src_mesh.split("|")[-1]),
+            lang.Lang(en="Targets ({0}):", ja=u"コピー先 ({0} 件):").output().format(len(res["dst_meshes"])),
+            "  " + ", ".join(m.split("|")[-1] for m in res["dst_meshes"]),
+        ]
+        if res["newly_bound_meshes"]:
+            detail_lines.append(
+                lang.Lang(en="Auto-bound meshes:", ja=u"自動バインドしたメッシュ:").output()
+                + " "
+                + ", ".join(m.split("|")[-1] for m in res["newly_bound_meshes"])
+            )
+        if res["added_influences"]:
+            detail_lines.append(
+                lang.Lang(en="Added influences ({0}):", ja=u"自動追加したボーン ({0} 本):").output().format(len(res["added_influences"]))
+            )
+            detail_lines.append("  " + ", ".join(j.split("|")[-1] for j in res["added_influences"][:30]))
+
+        self._set_status(short_msg, error=False, detail="\n".join(detail_lines))
+        if self.editor is not None and not getattr(self.editor, "closed_flag", False):
+            try:
+                self.editor.get_set_skin_weight(cycle=True)
+                self.editor.set_message(msg="- " + short_msg + " -", error=False)
+            except Exception:
+                pass
+
+    def _reset_force_freeze_rotate_adjust(self):
+        """強制フリーズ前の回転調整スピンボックスをすべて 0 に戻す。"""
+        for sp in self.fz_rot_adj_spins.values():
+            sp.setValue(0.0)
+
+    def run_force_freeze_joints(self):
+        """回転等調整 → ポーズ（キーフレーム）JSON 書き出し → 接続・ロック解除フリーズ → キーフレーム書き戻しを一括実行する。"""
+        joints = rig_cleanup_helper.collect_target_joints(
+            include_children=self.jnt_include_children_chk.isChecked()
+        )
+        if not joints:
+            self._set_status(
+                lang.Lang(
+                    en="Select one or more joints to adjust & freeze.",
+                    ja=u"回転調整・フリーズするジョイントを選択してください。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        do_rot = self.fz_rot_chk.isChecked()
+        do_scl = self.fz_scl_chk.isChecked()
+        do_trs = self.fz_trans_chk.isChecked()
+        if not (do_rot or do_scl or do_trs):
+            self._set_status(
+                lang.Lang(
+                    en="Check at least one channel (Rotate / Scale / Translate).",
+                    ja=u"Rotate / Scale / Translate のいずれか 1 つ以上をチェックしてください。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        if not self._confirm_skinned_joints_edit(joints):
+            return
+
+        rot_adj = (
+            float(self.fz_rot_adj_spins["X"].value()),
+            float(self.fz_rot_adj_spins["Y"].value()),
+            float(self.fz_rot_adj_spins["Z"].value()),
+        )
+        freeze_frame = float(self.fz_frame_spin.value()) if self.fz_use_frame_chk.isChecked() else None
+        clean_anim = self.fz_clean_anim_chk.isChecked()
+
+        cmds.undoInfo(openChunk=True, chunkName="SIWE_AllInOneFreezeJoints")
+        try:
+            res = rig_cleanup_helper.freeze_joints_with_pose_backup(
+                joints,
+                _get_storage_dir(),
+                freeze_rotate=do_rot,
+                freeze_scale=do_scl,
+                freeze_translate=do_trs,
+                backup_and_restore_pose=True,
+                freeze_frame=freeze_frame,
+                delete_unused_anim_curves=clean_anim,
+                rotate_adjust_deg=rot_adj,
+            )
+        except Exception as exc:
+            self._set_status(
+                lang.Lang(en="Force Freeze error: {0}", ja=u"一括フリーズエラー: {0}").output().format(exc),
+                error=True,
+            )
+            raise
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+        self._populate_joint_issue_table(rig_cleanup_helper.inspect_joints(joints))
+
+        fz = res["freeze"]
+        rt = res.get("restore")
+        short_msg = lang.Lang(
+            en="All-in-One Freeze done | Joints:{0} BrokenConn:{1} Unlocked:{2}",
+            ja=u"一括フリーズ完了 ｜ 対象:{0} 本 / 切断:{1} 件 / ロック解除:{2} 件",
+        ).output().format(fz["processed"], len(fz["broken"]), fz["unlocked"])
+        if rt is not None:
+            short_msg += lang.Lang(
+                en=" | Keyframes written back: {0} frame(s)",
+                ja=u" ｜ キー書き戻し: {0} フレーム",
+            ).output().format(rt["restored_frames"])
+
+        detail_lines = []
+        if res.get("rotate_adjust_applied"):
+            detail_lines.append(
+                lang.Lang(
+                    en="Rotation Adjust Applied: ({0:.2f}, {1:.2f}, {2:.2f}) deg",
+                    ja=u"適用した回転調整: ({0:.2f}, {1:.2f}, {2:.2f})°",
+                ).output().format(rot_adj[0], rot_adj[1], rot_adj[2])
+            )
+        if res.get("pose_json"):
+            detail_lines.append(
+                lang.Lang(en="Pose JSON: {0}", ja=u"書き出しポーズ JSON: {0}").output().format(res["pose_json"])
+            )
+        detail_lines.append(
+            lang.Lang(
+                en="Frozen -> Rotate:{0} / Scale:{1} / Translate:{2} / Removed orphan curves:{3}",
+                ja=u"フリーズ結果 → Rotate:{0} / Scale:{1} / Translate:{2} / 孤立カーブ削除:{3}",
+            ).output().format(fz["rot_fixed"], fz["scale_fixed"], fz["trans_fixed"], fz["removed_nodes"])
+        )
+        if fz["broken"]:
+            detail_lines.append(lang.Lang(en="Disconnected:", ja=u"切断した入力接続:").output())
+            for conn_str in fz["broken"][:40]:
+                detail_lines.append("  " + conn_str)
+            if len(fz["broken"]) > 40:
+                detail_lines.append("  ... (+{0})".format(len(fz["broken"]) - 40))
+        if rt is not None and rt.get("missing_joints"):
+            detail_lines.append(
+                lang.Lang(en="Missing joints on restore:", ja=u"書き戻し時に未検出のジョイント:").output()
+                + " "
+                + ", ".join(rt["missing_joints"])
+            )
+
+        self._set_status(short_msg, error=False, detail="\n".join(detail_lines))
+
+    def open_pose_backup_folder(self):
+        """ジョイントポーズ退避用 JSON フォルダを開く。"""
+        folder = os.path.normpath(rig_cleanup_helper.get_pose_backup_dir(_get_storage_dir()))
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(folder)
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        except Exception as exc:
+            self._set_status(
+                lang.Lang(en="Folder open error: {0}", ja=u"フォルダを開けませんでした: {0}").output().format(exc),
+                error=True,
+            )
+
+    # ------------------------------------------------------------------
+    # リファレンスジョイント上書きタブ ハンドラ
+    # ------------------------------------------------------------------
+    def store_quick_axis_reference(self):
+        """選択したリファレンスボーン（単体または複数指チェーン）の軸方向を JSON 保存なしでメモリへ一時保存する。"""
+        sel_joints = cmds.ls(sl=True, type="joint", long=True) or []
+        if not sel_joints:
+            self._set_status(
+                lang.Lang(
+                    en="Select a reference joint (or finger chain) in the viewport first.",
+                    ja=u"手本にするリファレンスボーンをビューポートで選択してください。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        include_children = self.quick_axis_children_chk.isChecked()
+        try:
+            self._quick_axis_ref = reference_joint_helper.capture_quick_axis_reference(
+                sel_joints,
+                include_children=include_children,
+            )
+        except Exception as exc:
+            self._set_status(
+                lang.Lang(en="Axis store error: {0}", ja=u"方向の一時保存エラー: {0}").output().format(exc),
+                error=True,
+            )
+            return
+
+        entries = self._quick_axis_ref.get("entries") or [self._quick_axis_ref]
+        name_disp = self._quick_axis_ref["short_name"]
+        if len(entries) > 1:
+            name_disp = "{0} (+{1})".format(name_disp, len(entries) - 1)
+        disp = lang.Lang(
+            en="Stored Axis: {0} (RotateOrder: {1})",
+            ja=u"一時保存中の方向: {0}（RotateOrder: {1}）",
+        ).output().format(name_disp, self._quick_axis_ref["rotateOrderLabel"])
+        self.quick_axis_label.setText(disp)
+        self.quick_axis_label.setToolTip("\n".join(e["full_path"] for e in entries[:30]))
+        self._set_status(
+            lang.Lang(
+                en="Stored axis direction from {0} ({1} bone(s), no JSON saved).",
+                ja=u"{0} のボーン軸方向を一時保存しました（{1} 本・JSON 保存なし）。変更したいボーンを選択してください。",
+            ).output().format(self._quick_axis_ref["short_name"], len(entries)),
+            error=False,
+        )
+
+    def apply_quick_axis_to_selected(self):
+        """一時保存したリファレンス方向へ、子階層を回転させずに選択ボーンのローカル回転軸だけを変更する。"""
+        if not self._quick_axis_ref:
+            self._set_status(
+                lang.Lang(
+                    en="Store a reference bone axis direction first.",
+                    ja=u"先に手本ボーンを選択して「リファレンス方向を一時保存」を押してください。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        sel_joints = cmds.ls(sl=True, type="joint", long=True) or []
+        if not sel_joints:
+            self._set_status(
+                lang.Lang(
+                    en="Select target joint(s) to change axis direction.",
+                    ja=u"軸方向を変更したいボーンをビューポートで選択してください。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        include_children = self.quick_axis_children_chk.isChecked()
+        match_rot_order = self.quick_axis_rot_order_chk.isChecked()
+        update_skin = self.quick_axis_skin_chk.isChecked()
+
+        cmds.undoInfo(openChunk=True, chunkName="SIWE_QuickApplyAxis")
+        try:
+            res = reference_joint_helper.apply_quick_axis_to_joints(
+                sel_joints,
+                self._quick_axis_ref,
+                include_children=include_children,
+                match_rotate_order=match_rot_order,
+                update_skin_bind_pre=update_skin,
+            )
+        except Exception as exc:
+            self._set_status(
+                lang.Lang(en="Quick axis apply error: {0}", ja=u"軸方向の変更エラー: {0}").output().format(exc),
+                error=True,
+            )
+            raise
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+        upd_cnt = len(res["updated"])
+        skip_cnt = len(res["skipped"])
+        skin_cnt = len(res["updated_skins"])
+        end_cnt = int(res.get("end_aligned", 0))
+        msg = lang.Lang(
+            en="Quick Axis Applied ({0}) | Updated:{1} EndAligned:{2} Skipped:{3}",
+            ja=u"軸方向を変更しました（基準: {0}） ｜ 変更:{1} 本 / 末端揃え:{2} / スキップ:{3}",
+        ).output().format(self._quick_axis_ref["short_name"], upd_cnt, end_cnt, skip_cnt)
+        if skin_cnt > 0:
+            msg += lang.Lang(
+                en=" | Skin bindPreMatrix:{0}",
+                ja=u" ｜ スキン補正:{0} 件",
+            ).output().format(skin_cnt)
+        detail = ""
+        if res["skipped"]:
+            detail = lang.Lang(
+                en="Skipped (locked or connected):\n  ",
+                ja=u"ロックまたは入力接続のためスキップ:\n  ",
+            ).output() + "\n  ".join(j.split("|")[-1] for j in res["skipped"])
+        self._set_status(msg, error=(upd_cnt == 0 and skip_cnt > 0), detail=detail or None)
+
+    def freeze_quick_selected_bone_rotations(self):
+        """選択ボーンの回転（Rotate / RotateAxis）を子階層を回転させずに jointOrient へフリーズする。"""
+        sel_joints = cmds.ls(sl=True, type="joint", long=True) or []
+        if not sel_joints:
+            self._set_status(
+                lang.Lang(
+                    en="Select bone(s) to freeze rotation first.",
+                    ja=u"回転をフリーズするボーンをビューポートで選択してください。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        include_children = self.quick_axis_children_chk.isChecked()
+        update_skin = self.quick_axis_skin_chk.isChecked()
+
+        cmds.undoInfo(openChunk=True, chunkName="SIWE_QuickFreezeRotation")
+        try:
+            res = reference_joint_helper.freeze_quick_selected_rotations(
+                sel_joints,
+                include_children=include_children,
+                update_skin_bind_pre=update_skin,
+            )
+        except Exception as exc:
+            self._set_status(
+                lang.Lang(en="Freeze rotation error: {0}", ja=u"回転フリーズエラー: {0}").output().format(exc),
+                error=True,
+            )
+            raise
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+        fz_cnt = len(res["frozen"])
+        skip_cnt = len(res["skipped"])
+        skin_cnt = len(res["updated_skins"])
+        msg = lang.Lang(
+            en="Frozen selected bone rotation | Frozen:{0} Skipped:{1}",
+            ja=u"選択ボーンの回転をフリーズしました ｜ フリーズ:{0} 本 / スキップ:{1} 本",
+        ).output().format(fz_cnt, skip_cnt)
+        if skin_cnt > 0:
+            msg += lang.Lang(
+                en=" | Skin bindPreMatrix:{0}",
+                ja=u" ｜ スキン補正:{0} 件",
+            ).output().format(skin_cnt)
+        detail = ""
+        if res["skipped"]:
+            detail = lang.Lang(
+                en="Skipped (locked or connected):\n  ",
+                ja=u"ロックまたは入力接続のためスキップ:\n  ",
+            ).output() + "\n  ".join(j.split("|")[-1] for j in res["skipped"])
+        self._set_status(msg, error=(fz_cnt == 0 and skip_cnt > 0), detail=detail or None)
+
+    def toggle_quick_axis_lra(self):
+        """クイック軸変更エリアから選択ボーンのローカル回転軸表示（LRA）を切り替える。"""
+        joints = rig_cleanup_helper.collect_target_joints(
+            include_children=self.quick_axis_children_chk.isChecked()
+        )
+        if not joints:
+            self._set_status(
+                lang.Lang(en="Select one or more joints first.", ja=u"軸表示を切り替えるボーンを選択してください。").output(),
+                error=True,
+            )
+            return
+        with qt.undo_chunk("SIWE_ToggleLocalAxes"):
+            state = rig_cleanup_helper.toggle_local_axes_visibility(joints)
+        label = "ON" if state else "OFF"
+        self._set_status(
+            lang.Lang(
+                en="Local Rotation Axes: {0} ({1} joint(s)).",
+                ja=u"ローカル回転軸表示を {0} に切り替えました（{1} 本）",
+            ).output().format(label, len(joints)),
+            error=False,
+        )
+
+    def _refresh_reference_mapping_summary(self):
+        """現在ジョイントとリファレンスジョイントの照合サマリーを更新する。"""
+        if not self._ref_source_records:
+            self.ref_summary_label.setText(
+                lang.Lang(
+                    en="Register or load a Reference skeleton to overwrite or create bones.",
+                    ja=u"リファレンスジョイントを登録（または JSON 読込）すると上書き・新規作成できます。",
+                ).output()
+            )
+            return
+        if not self._ref_cur_records:
+            pfx_info = reference_joint_helper.detect_skeleton_prefix_info(self._ref_source_records)
+            self.ref_summary_label.setText(
+                lang.Lang(
+                    en="Create Mode (No Current Skeleton) | Will create {0} bone(s) from Reference ({1})",
+                    ja=u"新規作成モード（現在ジョイント未登録） ｜ リファレンスから {0} 本を新規作成（ルート: {1}）",
+                ).output().format(len(self._ref_source_records), pfx_info["root_short"])
+            )
+            return
+        if self._ref_mapping_data is None:
+            self._ref_mapping_data = reference_joint_helper.build_auto_mapping(
+                self._ref_cur_records, self._ref_source_records
+            )
+        cur_rows = self._ref_mapping_data.get("current_rows") or []
+        extra_rows = self._ref_mapping_data.get("extra_ref_rows") or []
+        overwrite_cnt = sum(1 for r in cur_rows if r["action"] == "overwrite")
+        del_cnt = sum(1 for r in cur_rows if r["action"] == "delete_merge")
+        unmatched_cnt = sum(1 for r in cur_rows if not r.get("ref_full"))
+        add_cnt = sum(1 for r in extra_rows if r["action"] == "add")
+
+        self.ref_summary_label.setText(
+            lang.Lang(
+                en="Overwrite Mode | Match:{0} / Unmatched Current:{1} (Del:{2}) / Extra Ref:{3} (Add:{4}) | Meshes:{5}",
+                ja=u"上書きモード ｜ 対応:{0} 本 / 未対応(現在側):{1} 本（削除統合:{2}） / 追加候補:{3} 本（追加:{4}） ｜ 対象メッシュ:{5} 件",
+            ).output().format(
+                overwrite_cnt, unmatched_cnt, del_cnt, len(extra_rows), add_cnt, len(self._ref_cur_meshes)
+            )
+        )
+
+    def clear_current_skeleton_for_ref(self):
+        """登録済みの現在ジョイントをクリアし、リファレンスボーン新規作成モードへ切り替える。"""
+        self._ref_cur_records = []
+        self._ref_cur_meshes = []
+        self._ref_mapping_data = None
+        self.ref_cur_label.setText(
+            lang.Lang(
+                en="Current Skeleton: (Not set -> Create mode)",
+                ja=u"現在のジョイント: 未登録（未登録時はリファレンスを新規作成）",
+            ).output()
+        )
+        self.ref_cur_label.setToolTip("")
+        self._refresh_reference_mapping_summary()
+        self._set_status(
+            lang.Lang(
+                en="Cleared Current Skeleton registration (Create mode enabled).",
+                ja=u"現在ジョイントの登録をクリアしました（実行時はリファレンスボーンを新規作成します）。",
+            ).output(),
+            error=False,
+        )
+
+    def register_current_skeleton_for_ref(self):
+        """選択ジョイント・メッシュ（または記憶ジョイント）から現在のスケルトン全体と対象メッシュを登録する。"""
+        meshes = self._get_selected_polygon_transforms()
+        sel_joints = cmds.ls(sl=True, type="joint", long=True) or []
+
+        seed_nodes = list(meshes) + list(sel_joints)
+        if not seed_nodes and self._cached_joints:
+            seed_nodes = _resolve_cached_joints(self._cached_joints)
+            sel_joints = list(seed_nodes)
+
+        if not seed_nodes:
+            self._set_status(
+                lang.Lang(
+                    en="Select a current joint or bound mesh first.",
+                    ja=u"現在のジョイントまたはスキニング済みメッシュを選択してください。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        target_meshes = rig_cleanup_helper.find_meshes_sharing_skeleton(seed_nodes)
+        for m in meshes:
+            if _get_skin_cluster(m) and m not in target_meshes:
+                target_meshes.append(m)
+
+        seed_joints = list(sel_joints)
+        for m in target_meshes:
+            sc = _get_skin_cluster(m)
+            if sc:
+                infs = cmds.ls(cmds.skinCluster(sc, q=True, inf=True) or [], type="joint", long=True) or []
+                seed_joints.extend(infs)
+
+        cur_joints, roots = reference_joint_helper.collect_skeleton_hierarchy(seed_joints)
+        if not cur_joints:
+            self._set_status(
+                lang.Lang(
+                    en="No current joints found from selection.",
+                    ja=u"選択対象から現在のスケルトン階層を取得できませんでした。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        self._ref_cur_records = reference_joint_helper.snapshot_skeleton_info(cur_joints)
+        self._ref_cur_meshes = target_meshes
+        self._ref_mapping_data = None
+
+        root_disp = roots[0].split("|")[-1] if roots else cur_joints[0].split("|")[-1]
+        self.ref_cur_label.setText(
+            lang.Lang(
+                en="Current: {0} ({1} joints / {2} mesh(es))",
+                ja=u"現在: {0}（全 {1} 本 / {2} メッシュ）",
+            ).output().format(root_disp, len(self._ref_cur_records), len(target_meshes))
+        )
+        self.ref_cur_label.setToolTip("\n".join(cur_joints[:40]))
+        self._refresh_reference_mapping_summary()
+        self._set_status(
+            lang.Lang(
+                en="Registered current full skeleton: {0} ({1} joints, {2} mesh(es)).",
+                ja=u"現在のスケルトン全体を登録しました: {0}（{1} 本 / {2} メッシュ）",
+            ).output().format(root_disp, len(self._ref_cur_records), len(target_meshes)),
+            error=False,
+        )
+
+    def register_reference_skeleton(self):
+        """選択ジョイントを含むリファレンススケルトン全体（ルートから全階層）を登録する。"""
+        sel_joints = cmds.ls(sl=True, type="joint", long=True) or []
+        if not sel_joints:
+            self._set_status(
+                lang.Lang(
+                    en="Select a reference joint in Maya first.",
+                    ja=u"リファレンスにするジョイントを Maya 上で選択してください。",
+                ).output(),
+                error=True,
+            )
+            return
+
+        ref_joints, roots = reference_joint_helper.collect_skeleton_hierarchy(sel_joints)
+        if not ref_joints:
+            self._set_status(
+                lang.Lang(en="No reference joints found.", ja=u"リファレンスジョイントを取得できませんでした。").output(),
+                error=True,
+            )
+            return
+
+        self._ref_source_records = reference_joint_helper.snapshot_skeleton_info(ref_joints)
+        self._ref_mapping_data = None
+        pfx_info = reference_joint_helper.detect_skeleton_prefix_info(self._ref_source_records)
+        root_disp = pfx_info["root_short"] or (roots[0].split("|")[-1] if roots else ref_joints[0].split("|")[-1])
+        self.ref_src_label.setText(
+            lang.Lang(
+                en="Reference: {0} ({1} joints)",
+                ja=u"リファレンス: {0}（全 {1} 本）",
+            ).output().format(root_disp, len(self._ref_source_records))
+        )
+        self.ref_src_label.setToolTip("\n".join(ref_joints[:40]))
+        self._refresh_reference_mapping_summary()
+        self._set_status(
+            lang.Lang(
+                en="Registered full reference skeleton: {0} ({1} joints).",
+                ja=u"リファレンススケルトン全体を登録しました: {0}（{1} 本）",
+            ).output().format(root_disp, len(self._ref_source_records)),
+            error=False,
+        )
+
+    def load_reference_session_from_json(self):
+        """他シーンで保存したリファレンスジョイント JSON を読み込み、リファレンスとして登録する。"""
+        start_dir = reference_joint_helper.get_session_storage_dir(_get_storage_dir())
+        file_res = QFileDialog.getOpenFileName(
+            self,
+            lang.Lang(en="Load Reference Skeleton JSON", ja=u"リファレンスジョイント JSON を選択").output(),
+            start_dir,
+            "JSON Files (*.json)",
+        )
+        json_path = file_res[0] if isinstance(file_res, (tuple, list)) else file_res
+        if not json_path or not os.path.exists(json_path):
+            return
+
+        try:
+            payload = reference_joint_helper.load_reference_session_json(json_path)
+        except Exception as exc:
+            self._set_status(
+                lang.Lang(en="Failed to load Reference JSON: {0}", ja=u"リファレンス JSON 読込エラー: {0}").output().format(exc),
+                error=True,
+            )
+            return
+
+        self._ref_source_records = payload.get("reference_joints") or []
+        self._ref_mapping_data = None
+        pfx_info = reference_joint_helper.detect_skeleton_prefix_info(self._ref_source_records)
+        root_disp = pfx_info["root_short"] or (self._ref_source_records[0]["short_name"] if self._ref_source_records else "-")
+        self.ref_src_label.setText(
+            lang.Lang(
+                en="Reference [JSON]: {0} ({1} joints)",
+                ja=u"リファレンス[JSON]: {0}（全 {1} 本）",
+            ).output().format(root_disp, len(self._ref_source_records))
+        )
+        self.ref_src_label.setToolTip(json_path)
+        self._refresh_reference_mapping_summary()
+        self._set_status(
+            lang.Lang(
+                en="Loaded Reference skeleton from JSON: {0} ({1} joints).",
+                ja=u"JSON からリファレンススケルトンを読み込みました: {0}（{1} 本）",
+            ).output().format(root_disp, len(self._ref_source_records)),
+            error=False,
+            detail=json_path,
+        )
+
+    def _prompt_character_prefix_for_reference(self, is_create_mode=False):
+        """リファレンスボーンのプレフィックス規則（○○_Hips / _Hips / Hips）に応じてキャラ名を確認・入力させる。"""
+        pfx_info = reference_joint_helper.detect_skeleton_prefix_info(self._ref_source_records)
+        detected_pfx = pfx_info["prefix"]
+        pattern_type = pfx_info["pattern_type"]
+        root_base = pfx_info["root_base"] or "Hips"
+
+        # 現在スケルトン側に既存プレフィックスがあれば入力欄の初期候補にする
+        default_suggest = ""
+        if self._ref_cur_records:
+            cur_pfx_info = reference_joint_helper.detect_skeleton_prefix_info(self._ref_cur_records)
+            default_suggest = cur_pfx_info["prefix"]
+
+        action_ja = u"新規作成" if is_create_mode else u"変更（上書き）"
+        action_en = "create" if is_create_mode else "overwrite/rename"
+
+        if pattern_type == "named_prefix" and detected_pfx:
+            ans = QMessageBox.question(
+                self,
+                "SIWeightEditor Improve",
+                lang.Lang(
+                    en="Reference skeleton uses character prefix '{0}' (e.g. {0}_{1}).\nDo you want to {2} bones with '{0}'?\n\nClick 'No' to enter a new character name.",
+                    ja=u"リファレンスボーンにキャラ名「{0}」（例: {0}_{1}）が設定されています。\n「{0}」のボーンへ{2}しますか？\n\n「いいえ」を選択すると新しいキャラ名を入力できます。",
+                ).output().format(detected_pfx, root_base, action_ja if lang.Lang(en="en", ja="ja").output() == "ja" else action_en),
+                QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if ans == QMessageBox.Cancel:
+                return False, ""
+            if ans == QMessageBox.Yes:
+                return True, detected_pfx
+
+            # 「いいえ」の場合は新しいキャラ名を入力させる
+            new_name, ok = QInputDialog.getText(
+                self,
+                lang.Lang(en="Enter New Character Name", ja=u"新しいキャラ名を入力").output(),
+                lang.Lang(
+                    en="Enter new character prefix (e.g. charA -> charA_{0} / leave blank for no prefix):",
+                    ja=u"新しいキャラ名を入力してください（例: charA → charA_{0} ／ 空欄でプレフィックスなし）:",
+                ).output().format(root_base),
+                QLineEdit.Normal,
+                default_suggest,
+            )
+            if not ok:
+                return False, ""
+            return True, new_name.strip().rstrip("_")
+
+        # "_Hips" または "Hips" の場合はキャラ名を決めるダイアログを表示する
+        new_name, ok = QInputDialog.getText(
+            self,
+            lang.Lang(en="Set Character Name Prefix", ja=u"キャラ名（プレフィックス）を設定").output(),
+            lang.Lang(
+                en="Reference bone '{0}' has no character name prefix.\nEnter character name (e.g. charA -> charA_{1} / leave blank for '{1}'):",
+                ja=u"リファレンスボーン「{0}」にキャラ名が付いていません。\nキャラ名を入力してください（例: charA → charA_{1} ／ 空欄で「{1}」のまま）:",
+            ).output().format(pfx_info["root_short"] or root_base, root_base),
+            QLineEdit.Normal,
+            default_suggest,
+        )
+        if not ok:
+            return False, ""
+        return True, new_name.strip().rstrip("_")
+
+    def _apply_target_prefix_to_mapping(self, target_prefix):
+        """決定したキャラ名プレフィックスを現在のマッピング辞書（上書き先名・追加名）へ反映する。"""
+        if not self._ref_mapping_data:
+            return
+        prefixed_refs = reference_joint_helper.apply_prefix_to_records(self._ref_source_records, target_prefix=target_prefix)
+        ref_new_name_map = {r["full_path"]: r["prefixed_name"] for r in prefixed_refs}
+
+        for row in (self._ref_mapping_data.get("current_rows") or []):
+            rfp = row.get("ref_full") or ""
+            if rfp and rfp in ref_new_name_map and row.get("action") != "delete_merge":
+                desired = ref_new_name_map[rfp]
+                if desired != row.get("cur_short"):
+                    self._ref_mapping_data["has_diff"] = True
+                row["new_name"] = desired
+
+        for row in (self._ref_mapping_data.get("extra_ref_rows") or []):
+            rfp = row.get("ref_full") or ""
+            if rfp and rfp in ref_new_name_map:
+                row["new_name"] = ref_new_name_map[rfp]
+
+    def _ensure_reference_pair_ready(self, require_current=True):
+        """実行前にリファレンス（および必要時現在ジョイント）が揃っているか確認する。"""
+        if not self._ref_source_records:
+            sel_joints = cmds.ls(sl=True, type="joint", long=True) or []
+            if sel_joints:
+                self.register_reference_skeleton()
+        if not self._ref_source_records:
+            self._set_status(
+                lang.Lang(
+                    en="Please register or load a Reference skeleton first.",
+                    ja=u"先にリファレンスジョイントを登録（または JSON 読込）してください。",
+                ).output(),
+                error=True,
+            )
+            return False
+
+        if not require_current:
+            return True
+
+        if not self._ref_cur_records:
+            self._set_status(
+                lang.Lang(
+                    en="Please register Current Skeleton first to open mapping UI.",
+                    ja=u"対応調整 UI を開くには現在のジョイントを登録してください。",
+                ).output(),
+                error=True,
+            )
+            return False
+
+        cur_set = {r["full_path"] for r in self._ref_cur_records}
+        ref_set = {r["full_path"] for r in self._ref_source_records}
+        if cur_set & ref_set:
+            self._set_status(
+                lang.Lang(
+                    en="Current skeleton and Reference skeleton overlap. Please select separate skeletons.",
+                    ja=u"現在のジョイントとリファレンスジョイントが重複しています。別のスケルトンを登録してください。",
+                ).output(),
+                error=True,
+            )
+            return False
+
+        if self._ref_mapping_data is None:
+            self._ref_mapping_data = reference_joint_helper.build_auto_mapping(
+                self._ref_cur_records, self._ref_source_records
+            )
+        return True
+
+    def save_reference_session_only(self):
+        """リファレンスジョイント（および登録済みなら現在ジョイント）の情報を JSON へ保存する（他シーン再利用向け）。"""
+        if not self._ensure_reference_pair_ready(require_current=False):
+            return
+        try:
+            save_path, _ = reference_joint_helper.save_reference_session_json(
+                _get_storage_dir(),
+                self._ref_cur_records,
+                self._ref_source_records,
+                self._ref_cur_meshes,
+            )
+            self._set_status(
+                lang.Lang(
+                    en="Saved Reference skeleton JSON (reusable in other scenes).",
+                    ja=u"リファレンスジョイント情報を JSON 保存しました（他シーンでも読込可能）。",
+                ).output(),
+                error=False,
+                detail=save_path,
+            )
+        except Exception as exc:
+            self._set_status(
+                lang.Lang(en="JSON save error: {0}", ja=u"JSON 保存エラー: {0}").output().format(exc),
+                error=True,
+            )
+
+    def open_reference_session_folder(self):
+        """リファレンスジョイント用セッション JSON フォルダを開く。"""
+        folder = os.path.normpath(reference_joint_helper.get_session_storage_dir(_get_storage_dir()))
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(folder)
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        except Exception as exc:
+            self._set_status(
+                lang.Lang(en="Folder open error: {0}", ja=u"フォルダを開けませんでした: {0}").output().format(exc),
+                error=True,
+            )
+
+    def open_reference_mapping_ui(self):
+        """リネーム＆構造調整ダイアログを開いてユーザーによる調整を受け付ける。"""
+        if not self._ensure_reference_pair_ready(require_current=True):
+            return False
+        dialog = reference_joint_helper.ReferenceJointMappingDialog(
+            self._ref_cur_records,
+            self._ref_source_records,
+            self._ref_mapping_data,
+            parent=self,
+        )
+        exec_fn = getattr(dialog, "exec_", None) or getattr(dialog, "exec")
+        if exec_fn() == QDialog.Accepted:
+            self._ref_mapping_data = dialog.get_result_mapping()
+            self._refresh_reference_mapping_summary()
+            return True
+        return False
+
+    def run_reference_joint_overwrite(self):
+        """キャラ名確認を経て、現在ジョイントがあれば全階層上書き＆ウェイト再適用、未登録ならリファレンスボーンを新規作成する。"""
+        if not self._ensure_reference_pair_ready(require_current=False):
+            return
+
+        is_create_mode = (not self._ref_cur_records)
+        ok_pfx, target_prefix = self._prompt_character_prefix_for_reference(is_create_mode=is_create_mode)
+        if not ok_pfx:
+            self._set_status(
+                lang.Lang(en="Operation cancelled.", ja=u"処理をキャンセルしました。").output(),
+                error=False,
+            )
+            return
+
+        # 現在ジョイントが未登録の場合はリファレンスボーン一式をシーンへ新規作成する
+        if is_create_mode:
+            cmds.undoInfo(openChunk=True, chunkName="SIWE_CreateReferenceBones")
+            try:
+                save_path, _ = reference_joint_helper.save_reference_session_json(
+                    _get_storage_dir(),
+                    [],
+                    self._ref_source_records,
+                    [],
+                )
+                created_res = reference_joint_helper.create_skeleton_from_reference_records(
+                    self._ref_source_records,
+                    target_prefix=target_prefix,
+                )
+            except Exception as exc:
+                self._set_status(
+                    lang.Lang(en="Reference bone creation error: {0}", ja=u"リファレンスボーン作成エラー: {0}").output().format(exc),
+                    error=True,
+                )
+                raise
+            finally:
+                cmds.undoInfo(closeChunk=True)
+
+            root_name = created_res["roots"][0].split("|")[-1] if created_res["roots"] else "-"
+            short_msg = lang.Lang(
+                en="Created Reference skeleton: {0} ({1} bone(s))",
+                ja=u"リファレンスボーンを新規作成しました: {0}（{1} 本）",
+            ).output().format(root_name, len(created_res["created"]))
+            detail_msg = lang.Lang(
+                en="Saved Reference JSON: {0}\nRoot: {1}",
+                ja=u"保存 JSON: {0}\n作成ルート: {1}",
+            ).output().format(save_path, root_name)
+            self._set_status(short_msg, error=False, detail=detail_msg)
+            return
+
+        # 現在ジョイントが登録されている場合は全階層の上書き・リネーム・構造調整＆ウェイト再適用を実行する
+        if not self._ensure_reference_pair_ready(require_current=True):
+            return
+
+        self._apply_target_prefix_to_mapping(target_prefix)
+        self._refresh_reference_mapping_summary()
+
+        # 名前や構造に差分がある場合は自動でリネーム・構造調整 UI を開いて確認してもらう
+        if self.ref_opt_auto_dialog_chk.isChecked() and self._ref_mapping_data.get("has_diff", False):
+            accepted = self.open_reference_mapping_ui()
+            if not accepted:
+                self._set_status(
+                    lang.Lang(en="Reference joint overwrite cancelled.", ja=u"リファレンス上書きをキャンセルしました。").output(),
+                    error=False,
+                )
+                return
+
+        cmds.undoInfo(openChunk=True, chunkName="SIWE_ReferenceJointOverwrite")
+        try:
+            res = reference_joint_helper.execute_reference_joint_overwrite(
+                self._ref_cur_records,
+                self._ref_source_records,
+                self._ref_mapping_data,
+                self._ref_cur_meshes,
+                _get_storage_dir(),
+                overwrite_orient=self.ref_opt_orient_chk.isChecked(),
+                overwrite_position=self.ref_opt_pos_chk.isChecked(),
+                overwrite_rotate_order=self.ref_opt_rot_order_chk.isChecked(),
+                apply_rename=self.ref_opt_rename_chk.isChecked(),
+                include_added_in_skin=self.ref_opt_bind_added_chk.isChecked(),
+            )
+        except Exception as exc:
+            self._set_status(
+                lang.Lang(en="Reference overwrite error: {0}", ja=u"リファレンス上書きエラー: {0}").output().format(exc),
+                error=True,
+            )
+            raise
+        finally:
+            cmds.undoInfo(closeChunk=True)
+
+        self.reload_record_list()
+        short_msg = lang.Lang(
+            en="Overwrite done | Axis:{0} Added:{1} Deleted:{2} Renamed:{3} Meshes:{4}",
+            ja=u"リファレンス上書き完了 ｜ 軸上書き:{0} 追加:{1} 削除統合:{2} リネーム:{3} 再バインド:{4} メッシュ",
+        ).output().format(
+            res["overwritten"],
+            res["added"],
+            res["deleted"],
+            res["renamed"],
+            len(res["rebound_meshes"]),
+        )
+        detail_msg = lang.Lang(
+            en="Session JSON: {0}\nRebound Meshes:\n  {1}",
+            ja=u"保存 JSON: {0}\nウェイト再適用メッシュ:\n  {1}",
+        ).output().format(
+            res["session_json"],
+            "\n  ".join(m.split("|")[-1] for m in res["rebound_meshes"]) if res["rebound_meshes"] else "-",
+        )
+        self._set_status(short_msg, error=False, detail=detail_msg)
+        if self.editor is not None and not getattr(self.editor, "closed_flag", False):
+            try:
+                self.editor.get_set_skin_weight(cycle=True)
+                self.editor.set_message(msg="- " + short_msg + " -", error=False)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # タブ 3 ハンドラ：メッシュ ＆ シーンクリーンアップ
@@ -2203,7 +5365,10 @@ class ModelEditWindow(qt.SubWindow):
                 keep_history=False,
             )
         except Exception as exc:
-            self._set_status("Mesh Cleanup error: {0}".format(exc), error=True)
+            self._set_status(
+                lang.Lang(en="Mesh Cleanup error: {0}", ja=u"Mesh Cleanup エラー: {0}").output().format(exc),
+                error=True,
+            )
             raise
         finally:
             cmds.undoInfo(closeChunk=True)
@@ -2238,10 +5403,10 @@ class ModelEditWindow(qt.SubWindow):
     def run_scene_scan_ui(self):
         """シーン内の不要ノード件数を診断して表示する。"""
         scan = rig_cleanup_helper.scan_scene_cleanup_targets()
-        summary = (
-            u"診断結果 ｜ 未使用中間シェイプ: {0} 件 / 孤立 bindPose: {1} 件 / "
-            u"未知ノード: {2} 件 / 空グループ: {3} 件"
-        ).format(
+        summary = lang.Lang(
+            en="Scan Result | Unused Intermediates: {0} / Orphaned bindPose: {1} / Unknown Nodes: {2} / Empty Groups: {3}",
+            ja=u"診断結果 ｜ 未使用中間シェイプ: {0} 件 / 孤立 bindPose: {1} 件 / 未知ノード: {2} 件 / 空グループ: {3} 件",
+        ).output().format(
             len(scan["unused_intermediates"]),
             len(scan["orphaned_bind_poses"]),
             len(scan["unknown_nodes"]),
@@ -2268,15 +5433,18 @@ class ModelEditWindow(qt.SubWindow):
                 clean_unused_shading=self.sc_unused_mat_chk.isChecked(),
             )
         except Exception as exc:
-            self._set_status("Scene Cleanup error: {0}".format(exc), error=True)
+            self._set_status(
+                lang.Lang(en="Scene Cleanup error: {0}", ja=u"Scene Cleanup エラー: {0}").output().format(exc),
+                error=True,
+            )
             raise
         finally:
             cmds.undoInfo(closeChunk=True)
 
-        summary = (
-            u"シーンクリーンアップ完了 ｜ 中間シェイプ: {0} / 孤立 bindPose: {1} / "
-            u"未知ノード: {2} / 空グループ: {3} / 未使用シェーダー: {4}"
-        ).format(
+        summary = lang.Lang(
+            en="Scene Cleanup Done | Intermediates: {0} / bindPose: {1} / Unknown: {2} / Empty Groups: {3} / Unused Shaders: {4}",
+            ja=u"シーンクリーンアップ完了 ｜ 中間シェイプ: {0} / 孤立 bindPose: {1} / 未知ノード: {2} / 空グループ: {3} / 未使用シェーダー: {4}",
+        ).output().format(
             report["unused_intermediates"],
             report["orphaned_bind_poses"],
             report["unknown_nodes"],

@@ -25,6 +25,7 @@ from .widgets import (
     EditorSpinbox,
     MyHeaderView,
     RightClickTableView,
+    WeightSlider,
 )
 
 if state.PYTHON_VER >= 3:
@@ -282,7 +283,7 @@ class EditorUIBuilderMixin(object):
         enforce_layout.addWidget(self.round_but)
         enforce_layout.addWidget(self.round_box)
         
-        # ジョイント選択ツールタイプ
+        # ジョイント選択ツールタイプ（標準機能：ヘッダー右クリック時のツール切替）
         sel_joint_widget = QWidget()
         sel_joint_widget.setGeometry(QRect(0, 0, 0 ,0))
         sel_joint_layout = QHBoxLayout()
@@ -290,9 +291,7 @@ class EditorUIBuilderMixin(object):
         sel_joint_layout.setSpacing(0)
         sel_joint_widget.setLayout(sel_joint_layout)
         but_w = 22
-        j_hl_w = 82
-        used_jnt_w = 84
-        sel_joint_total_w = but_w * 4 + j_hl_w + used_jnt_w + 10
+        sel_joint_total_w = but_w * 4 + 10
         sel_joint_widget.setMinimumWidth(sel_joint_total_w)
         sel_joint_widget.setMaximumWidth(sel_joint_total_w)
         sel_joint_widget.setMaximumHeight(state.WIDGET_HEIGHT+5)
@@ -313,64 +312,90 @@ class EditorUIBuilderMixin(object):
                             ja=u'ヘッダー右クリックでジョイント選択するときにツールをトランスレーションにする').output()
         self.t_but = qt.make_flat_btton(name='', bg=self.hilite, border_col=180, w_max=but_w, w_min=but_w, h_max=but_h, h_min=but_h, 
                                                             flat=True, hover=True, checkable=True, destroy_flag=True, icon=self.icon_path+'t.png', tip=tip)
-        tip = lang.Lang(
-            en='Highlight weighted / selected joints in viewport (restores original colors safely)\nRight click to switch mode (Heatmap / Selected Column)',
-            ja=u'影響ボーンや選択列ボーンをビューポート上で色強調（終了・保存時に元の色を復元）\n右クリックでモード切替（ヒートマップ / 選択列のみ）'
-        ).output()
-        self.joint_hl_but = qt.make_flat_btton(name='Joint Hilite', bg=self.hilite, border_col=180, w_max=j_hl_w, w_min=j_hl_w, h_max=but_h, h_min=but_h, 
-                                                            flat=True, hover=True, checkable=True, destroy_flag=True, tip=tip)
         if MAYA_VER >= 2025:
             self.sel_joint_but_group.idClicked.connect(self.change_joint_tool_mode)
         else:
             self.sel_joint_but_group.buttonClicked[int].connect(self.change_joint_tool_mode)
-        self.joint_hl_but.setChecked(self.joint_hilite)
-        self.joint_hl_but.clicked.connect(self.reset_joint_hl)
-        self.joint_hl_but.rightClicked.connect(self.pop_joint_hilite_menu)
         self.sel_joint_but_group.addButton(self.n_but, 0)
         self.sel_joint_but_group.addButton(self.s_but, 1)
         self.sel_joint_but_group.addButton(self.r_but, 2)
         self.sel_joint_but_group.addButton(self.t_but, 3)
         self.sel_joint_but_group.button(self.joint_tool).setChecked(True)
-        
-        tip = lang.Lang(
-            en='Show only weighted / selected joints using drawStyle (hides unrelated parents & children)\nRight click to switch mode (Used Only / Keep Bone Shape)',
-            ja=u'drawStyle を使って使用中ボーンだけをピンポイント表示（無関係な親子も非表示・保存時自動復元）\n右クリックで表示範囲切替（使用ボーンのみ / 骨形状維持）'
-        ).output()
-        self.used_joint_vis_but = qt.make_flat_btton(name='Used Joints', bg=self.hilite, border_col=180, w_max=used_jnt_w, w_min=used_jnt_w, h_max=but_h, h_min=but_h, 
-                                                            flat=True, hover=True, checkable=True, destroy_flag=True, tip=tip)
-        self.used_joint_vis_but.setChecked(getattr(self, 'used_joints', False))
-        self.used_joint_vis_but.clicked.connect(self.update_used_joint_visibility)
-        self.used_joint_vis_but.rightClicked.connect(self.pop_used_joints_menu)
 
         sel_joint_layout.addWidget(self.n_but)
         sel_joint_layout.addWidget(self.s_but)
         sel_joint_layout.addWidget(self.r_but)
         sel_joint_layout.addWidget(self.t_but)
-        sel_joint_layout.addWidget(self.joint_hl_but)
-        sel_joint_layout.addWidget(self.used_joint_vis_but)
 
-        # 拡張機能ボタン群（Bone Vis / Remap / Keep Bone / Model Edit）
-        improve_widget = QWidget()
-        improve_layout = QHBoxLayout()
-        improve_layout.setContentsMargins(2, 2, 4, 2)
-        improve_layout.setSpacing(0)
-        improve_widget.setLayout(improve_layout)
+        # Improve 追加機能：表示・選択補助系グループ（Joint Hilite / Used Joints / Bone Vis / Keep Bone）
+        view_ui_col = [50, 68, 76]
+        view_hi_col = [74, 134, 156]
+        view_border_col = [116, 170, 190]
+        view_text_col = 230
+
+        improve_view_widget = QWidget()
+        improve_view_layout = QHBoxLayout()
+        improve_view_layout.setContentsMargins(2, 2, 4, 2)
+        improve_view_layout.setSpacing(0)
+        improve_view_widget.setLayout(improve_view_layout)
+        tag_view_w = 42
+        j_hl_w = 82
+        used_jnt_w = 84
         bone_vis_w = 68
-        remap_w = 58
         keep_bone_w = 78
-        model_edit_w = 74
-        improve_total_w = bone_vis_w + remap_w + keep_bone_w + model_edit_w + 10
-        improve_widget.setMinimumWidth(improve_total_w)
-        improve_widget.setMaximumWidth(improve_total_w)
-        improve_widget.setMaximumHeight(state.WIDGET_HEIGHT+5)
+        improve_view_total_w = tag_view_w + j_hl_w + used_jnt_w + bone_vis_w + keep_bone_w + 10
+        improve_view_widget.setMinimumWidth(improve_view_total_w)
+        improve_view_widget.setMaximumWidth(improve_view_total_w)
+        improve_view_widget.setMaximumHeight(state.WIDGET_HEIGHT+5)
+
+        self.improve_view_tag = QLabel('+View')
+        self.improve_view_tag.setAlignment(Qt.AlignCenter)
+        self.improve_view_tag.setFixedSize(tag_view_w, but_h)
+        self.improve_view_tag.setStyleSheet(
+            'QLabel { background-color: #263840; color: #8ad8f0; font-weight: bold; font-size: 10px;'
+            ' border: 1px solid #74aabe; border-right: 0px; }'
+        )
+        self.improve_view_tag.setToolTip(
+            lang.Lang(
+                en='[Improve Add-on: Display / Selection Helpers]\nToggle buttons for viewport bone display and selection retention.',
+                ja=u'[Improve 追加機能 / 表示・選択補助系]\nビューポート表示やボーン選択維持を切り替えるトグルボタン群です。',
+            ).output()
+        )
 
         tip = lang.Lang(
-            en='Visualize weighted bones of selected vertices in 3D viewport (X-Ray)\nRight click for display options',
-            ja=u'選択頂点にウェイトが入っているボーンを3Dビューポート上に透視表示（X-Ray）\n右クリックで表示オプションを設定'
+            en='[Improve Add-on / Display]\nHighlight weighted / selected joints in viewport (restores original colors safely)\nRight click to switch mode (Heatmap / Selected Column)',
+            ja=u'[Improve 追加機能 / 表示系]\n影響ボーンや選択列ボーンをビューポート上で色強調（終了・保存時に元の色を復元）\n右クリックでモード切替（ヒートマップ / 選択列のみ）'
+        ).output()
+        self.joint_hl_but = qt.make_flat_btton(
+            name='Joint Hilite', text=view_text_col, ui_color=view_ui_col, bg=view_hi_col, border_col=view_border_col,
+            w_max=j_hl_w, w_min=j_hl_w, h_max=but_h, h_min=but_h,
+            flat=True, hover=True, checkable=True, destroy_flag=True, tip=tip
+        )
+        self.joint_hl_but.setChecked(self.joint_hilite)
+        self.joint_hl_but.clicked.connect(self.reset_joint_hl)
+        self.joint_hl_but.rightClicked.connect(self.pop_joint_hilite_menu)
+
+        tip = lang.Lang(
+            en='[Improve Add-on / Display]\nShow only weighted / selected joints using drawStyle (hides unrelated parents & children)\nRight click to switch mode (Used Only / Keep Bone Shape)',
+            ja=u'[Improve 追加機能 / 表示系]\ndrawStyle を使って使用中ボーンだけをピンポイント表示（無関係な親子も非表示・保存時自動復元）\n右クリックで表示範囲切替（使用ボーンのみ / 骨形状維持）'
+        ).output()
+        self.used_joint_vis_but = qt.make_flat_btton(
+            name='Used Joints', text=view_text_col, ui_color=view_ui_col, bg=view_hi_col, border_col=view_border_col,
+            w_max=used_jnt_w, w_min=used_jnt_w, h_max=but_h, h_min=but_h,
+            flat=True, hover=True, checkable=True, destroy_flag=True, tip=tip
+        )
+        self.used_joint_vis_but.setChecked(getattr(self, 'used_joints', False))
+        self.used_joint_vis_but.clicked.connect(self.update_used_joint_visibility)
+        self.used_joint_vis_but.rightClicked.connect(self.pop_used_joints_menu)
+
+        tip = lang.Lang(
+            en='[Improve Add-on / Display]\nVisualize weighted bones of selected vertices in 3D viewport (X-Ray)\nRight click for display options',
+            ja=u'[Improve 追加機能 / 表示系]\n選択頂点にウェイトが入っているボーンを3Dビューポート上に透視表示（X-Ray）\n右クリックで表示オプションを設定'
         ).output()
         self.bone_vis_but = qt.make_flat_btton(
-            name='Bone Vis', bg=self.hilite, border_col=180, w_max=bone_vis_w, w_min=bone_vis_w,
-            h_max=but_h, h_min=but_h, flat=True, hover=True, checkable=True, destroy_flag=True, tip=tip
+            name='Bone Vis', text=view_text_col, ui_color=view_ui_col, bg=view_hi_col, border_col=view_border_col,
+            w_max=bone_vis_w, w_min=bone_vis_w, h_max=but_h, h_min=but_h,
+            flat=True, hover=True, checkable=True, destroy_flag=True, tip=tip
         )
         self.bone_vis_but.setChecked(getattr(self, 'bone_vis', False))
         self.bone_vis_but.clicked.connect(self.toggle_bone_visualizer)
@@ -382,45 +407,86 @@ class EditorUIBuilderMixin(object):
             aggregate_mode=getattr(self, 'bone_vis_mode', 'avg'),
         )
 
-        self.bone_remap_window = None
-        tip = lang.Lang(
-            en='Open Bone Weight Remap window to move or add weights between bones in real time',
-            ja=u'選択頂点のウェイトを別ボーンへ移動・追加する専用ウィンドウを開く'
-        ).output()
-        self.bone_remap_but = qt.make_flat_btton(
-            name='Remap', bg=self.hilite, border_col=180, w_max=remap_w, w_min=remap_w,
-            h_max=but_h, h_min=but_h, flat=True, hover=True, checkable=False, destroy_flag=True, tip=tip
-        )
-        self.bone_remap_but.clicked.connect(self.open_bone_remap_window)
-
         self.last_selected_influences = []
         self._restoring_bone_selection = False
         tip = lang.Lang(
-            en='Keep previous bone column selected when switching vertices (even when 0 weight under Filter)',
-            ja=u'別の頂点を選択しても直前に選んでいたボーン列の選択状態を維持します\nFilter ON 時でもウェイト0の列として残るため、そのままスライダーで追加できます'
+            en='[Improve Add-on / Display]\nKeep previous bone column selected when switching vertices (even when 0 weight under Filter)',
+            ja=u'[Improve 追加機能 / 表示系]\n別の頂点を選択しても直前に選んでいたボーン列の選択状態を維持します\nFilter ON 時でもウェイト0の列として残るため、そのままスライダーで追加できます'
         ).output()
         self.keep_bone_but = qt.make_flat_btton(
-            name='Keep Bone', bg=self.hilite, border_col=180, w_max=keep_bone_w, w_min=keep_bone_w,
-            h_max=but_h, h_min=but_h, flat=True, hover=True, checkable=True, destroy_flag=True, tip=tip
+            name='Keep Bone', text=view_text_col, ui_color=view_ui_col, bg=view_hi_col, border_col=view_border_col,
+            w_max=keep_bone_w, w_min=keep_bone_w, h_max=but_h, h_min=but_h,
+            flat=True, hover=True, checkable=True, destroy_flag=True, tip=tip
         )
         self.keep_bone_but.setChecked(getattr(self, 'keep_bone', True))
         self.keep_bone_but.clicked.connect(self.toggle_keep_bone)
 
+        improve_view_layout.addWidget(self.improve_view_tag)
+        improve_view_layout.addWidget(self.joint_hl_but)
+        improve_view_layout.addWidget(self.used_joint_vis_but)
+        improve_view_layout.addWidget(self.bone_vis_but)
+        improve_view_layout.addWidget(self.keep_bone_but)
+
+        # Improve 追加機能：専用ウィンドウ起動系グループ（Remap / Model Edit）
+        win_ui_col = [66, 56, 86]
+        win_hi_col = [114, 92, 160]
+        win_border_col = [152, 134, 198]
+        win_text_col = 235
+
+        improve_win_widget = QWidget()
+        improve_win_layout = QHBoxLayout()
+        improve_win_layout.setContentsMargins(2, 2, 4, 2)
+        improve_win_layout.setSpacing(0)
+        improve_win_widget.setLayout(improve_win_layout)
+        tag_win_w = 38
+        remap_w = 58
+        model_edit_w = 74
+        improve_win_total_w = tag_win_w + remap_w + model_edit_w + 10
+        improve_win_widget.setMinimumWidth(improve_win_total_w)
+        improve_win_widget.setMaximumWidth(improve_win_total_w)
+        improve_win_widget.setMaximumHeight(state.WIDGET_HEIGHT+5)
+
+        self.improve_win_tag = QLabel('+Win')
+        self.improve_win_tag.setAlignment(Qt.AlignCenter)
+        self.improve_win_tag.setFixedSize(tag_win_w, but_h)
+        self.improve_win_tag.setStyleSheet(
+            'QLabel { background-color: #312844; color: #cdb8ff; font-weight: bold; font-size: 10px;'
+            ' border: 1px solid #9886c6; border-right: 0px; }'
+        )
+        self.improve_win_tag.setToolTip(
+            lang.Lang(
+                en='[Improve Add-on: Tool Windows]\nButtons that open dedicated auxiliary tool windows.',
+                ja=u'[Improve 追加機能 / ウィンドウ起動系]\n押すと専用の補助ツールウィンドウが開くボタン群です。',
+            ).output()
+        )
+
+        self.bone_remap_window = None
+        tip = lang.Lang(
+            en='[Improve Add-on / Window]\nOpen Bone Weight Remap window to move or add weights between bones in real time',
+            ja=u'[Improve 追加機能 / ウィンドウ]\n選択頂点のウェイトを別ボーンへ移動・追加する専用ウィンドウを開く'
+        ).output()
+        self.bone_remap_but = qt.make_flat_btton(
+            name='Remap', text=win_text_col, ui_color=win_ui_col, bg=win_hi_col, border_col=win_border_col,
+            w_max=remap_w, w_min=remap_w, h_max=but_h, h_min=but_h,
+            flat=True, hover=True, checkable=False, destroy_flag=True, tip=tip
+        )
+        self.bone_remap_but.clicked.connect(self.open_bone_remap_window)
+
         self.model_edit_window = None
         tip = lang.Lang(
-            en='Open simple modeling edit window (record weights to JSON -> unbind/freeze -> edit mesh -> rebind & restore)',
-            ja=u'簡易モデリング修正ウィンドウを開く（ウェイトをJSON記録→解除・フリーズ→頂点・エッジ修正→再バインド＆補間復元）'
+            en='[Improve Add-on / Window]\nOpen Model & Bone Edit / Cleanup window (JSON weight backup, safe bind, mirror/copy, joint cleanup)',
+            ja=u'[Improve 追加機能 / ウィンドウ]\nモデル＆ボーン修正 / バインド・ミラー / ジョイント整理の専用ウィンドウを開く'
         ).output()
         self.model_edit_but = qt.make_flat_btton(
-            name='Model Edit', bg=self.hilite, border_col=180, w_max=model_edit_w, w_min=model_edit_w,
-            h_max=but_h, h_min=but_h, flat=True, hover=True, checkable=False, destroy_flag=True, tip=tip
+            name='Model Edit', text=win_text_col, ui_color=win_ui_col, bg=win_hi_col, border_col=win_border_col,
+            w_max=model_edit_w, w_min=model_edit_w, h_max=but_h, h_min=but_h,
+            flat=True, hover=True, checkable=False, destroy_flag=True, tip=tip
         )
         self.model_edit_but.clicked.connect(self.open_model_edit_window)
 
-        improve_layout.addWidget(self.bone_vis_but)
-        improve_layout.addWidget(self.bone_remap_but)
-        improve_layout.addWidget(self.keep_bone_but)
-        improve_layout.addWidget(self.model_edit_but)
+        improve_win_layout.addWidget(self.improve_win_tag)
+        improve_win_layout.addWidget(self.bone_remap_but)
+        improve_win_layout.addWidget(self.model_edit_but)
         
         # ボタン群の並びを一括設定
         self.but_list.append(show_widget)
@@ -428,7 +494,8 @@ class EditorUIBuilderMixin(object):
         self.but_list.append(show_bad_widget)
         self.but_list.append(icon_widget)
         self.but_list.append(enforce_widget)
-        self.but_list.append(improve_widget)
+        self.but_list.append(improve_view_widget)
+        self.but_list.append(improve_win_widget)
         #self.but_list.append(decimal_widget)
         #self.but_list.append(lock_widget)
         #self.but_list.append(mode_widget)
@@ -729,7 +796,7 @@ class EditorUIBuilderMixin(object):
                             ja=u'・Toggle_Mute_Skinning \n\n選択メッシュのスキニングのミュート状態をトグル\n何も選択せずに実行すると全てのスキンメッシュに適用').output()
         self.toggle_mute_but = qt.make_flat_btton(name='', bg=self.hilite, border_col=180, w_max=state.BUTTON_HEIGHT, w_min=state.BUTTON_HEIGHT, h_max=but_h, h_min=but_h, 
                                                     flat=True, hover=True, checkable=False, destroy_flag=True, icon=self.icon_path+'mute.png', tip=tip)
-        self.toggle_mute_but.clicked.connect(weight.toggle_mute_skinning)
+        self.toggle_mute_but.clicked.connect(qt.Callback(weight.toggle_mute_skinning))
         sub_tool2_layout.addWidget(self.toggle_mute_but)
         
         #バインドポーズ
@@ -769,7 +836,7 @@ class EditorUIBuilderMixin(object):
                             u'SI Side Bar の同機能とも互換性があります').output()
         self.go_import_but = qt.make_flat_btton(name='', bg=self.hilite, border_col=180, w_max=state.BUTTON_HEIGHT, w_min=state.BUTTON_HEIGHT, h_max=but_h, h_min=but_h, 
                                                     flat=True, hover=True, checkable=False, destroy_flag=True, icon=self.icon_path+'go_import.png', tip=tip)
-        self.go_import_but.clicked.connect(go.maya_import)
+        self.go_import_but.clicked.connect(qt.Callback(go.maya_import))
         sub_tool2_layout.addWidget(self.go_import_but)
         
         sub_tool2_layout.addWidget(QLabel(' '))
@@ -803,7 +870,7 @@ class EditorUIBuilderMixin(object):
                             ja=u'・使われていないインフルエンスの除去').output()
         self.rem_unused_inf_but = qt.make_flat_btton(name='', bg=self.hilite, border_col=180, w_max=state.BUTTON_HEIGHT, w_min=state.BUTTON_HEIGHT, h_max=but_h, h_min=but_h, 
                                                     flat=True, hover=True, checkable=False, destroy_flag=True, icon=self.icon_path+'inf_clean.png', tip=tip)
-        self.rem_unused_inf_but.clicked.connect(self.remove_unused_influences)
+        self.rem_unused_inf_but.clicked.connect(qt.Callback(self.remove_unused_influences))
         sub_tool2_layout.addWidget(self.rem_unused_inf_but)
         
         self.but_list3.append(sub_tool0_widget)
@@ -987,7 +1054,7 @@ class EditorUIBuilderMixin(object):
         self.weight_input.customContextMenuRequested.connect(self.pop_slider_stat_menu)
         sld_layout.addWidget(self.weight_input)
         #スライダバーを設定
-        self.weight_input_sld = QSlider(Qt.Horizontal)
+        self.weight_input_sld = WeightSlider(Qt.Horizontal)
         self.weight_input_sld.setRange(0, 255)
         self.weight_input_sld.setContextMenuPolicy(Qt.CustomContextMenu)
         self.weight_input_sld.customContextMenuRequested.connect(self.pop_slider_stat_menu)
@@ -1051,13 +1118,39 @@ class EditorUIBuilderMixin(object):
         seach_layout.addWidget(QLabel(' '))
         
         self.search_line = EditorLineEdit()
+        search_tip = lang.Lang(
+            en='Search joints (space-separated):\n'
+               '  arm leg     : partial match (OR)\n'
+               '  +arm +_L    : must match all (AND)\n'
+               '  -twist      : exclude matching joints\n'
+               '  =Arm_L      : exact name match\n'
+               '  Arm_*_L     : wildcard match',
+            ja=u'ジョイント検索（スペース区切り）:\n'
+               u'  arm leg     : いずれかに部分一致（OR）\n'
+               u'  +arm +_L    : すべて含む（AND）\n'
+               u'  -twist      : 該当ボーンを除外（!も可）\n'
+               u'  =Arm_L      : ボーン名の厳密一致\n'
+               u'  Arm_*_L     : ワイルドカード一致'
+        ).output()
+        self.search_line.setToolTip(search_tip)
         self.search_line.modifired.connect(self.change_static_text)
         self.search_line.editingFinished.connect(lambda : self.search_joint(as_interractive=False))
         self.search_line.textChanged.connect(lambda : self.search_joint(as_interractive=True))
         seach_layout.addWidget(self.search_line)
+
+        tip = lang.Lang(
+            en='Flip L / R naming in search bar (L <-> R, Left <-> Right)',
+            ja=u'検索欄の左右表記（L ⇔ R / Left ⇔ Right）をワンクリックで反転'
+        ).output()
+        self.search_flip_lr_but = qt.make_flat_btton(
+            name='L<>R', bg=self.hilite, border_col=180, w_max=38, w_min=38, h_max=18, h_min=18,
+            flat=True, hover=True, checkable=False, destroy_flag=True, icon=None, tip=tip
+        )
+        self.search_flip_lr_but.clicked.connect(self.flip_search_lr)
+        seach_layout.addWidget(self.search_flip_lr_but)
         
-        tip = lang.Lang(en='Select joints from current influence list', 
-                            ja=u'現在のインフルエンス一覧からジョイントを選択').output()
+        tip = lang.Lang(en='Open non-modal Joints search window', 
+                            ja=u'非モーダルのジョイント検索ウィンドウを開く').output()
         self.joint_list_but = qt.make_flat_btton(name='Joints...', bg=self.hilite, border_col=180, w_max=58, w_min=58, h_max=18, h_min=18, 
                                                             flat=True, hover=True, checkable=False, destroy_flag=True, icon=None, tip=tip)
         self.joint_list_but.clicked.connect(self.open_joint_search_dialog)

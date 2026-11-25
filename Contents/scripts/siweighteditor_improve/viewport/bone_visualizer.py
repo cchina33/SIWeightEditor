@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""選択頂点のウェイト先ボーンを 3D ビューポート上で視覚化する制御モジュール。"""
+"""選択頂点のウェイト先ボーンを 3D ビューポート上で視覚化する制御モジュール"""
 
 import os
 from collections import defaultdict

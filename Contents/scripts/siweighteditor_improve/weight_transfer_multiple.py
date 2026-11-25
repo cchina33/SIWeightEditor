@@ -301,11 +301,12 @@ class WeightTransferMultiple(qt.SubWindow):
             self.bake_node_weight_dict[node] += new_weights
             self.bake_node_inf_dict[node] += inf_id_list
             self.org_node_weight_dict[node] += org_weights
-            self.undo_node_weight_dict[node] = [org_weights_list[id] for id in vtxArray]
-            self.redo_node_weight_dict[node] = [trans_weights_list[id] for id in vtxArray]
-            
+            self.undo_node_weight_dict[node] = [list(org_weights_list[id]) for id in vtxArray]
+            self.redo_node_weight_dict[node] = [list(trans_weights_list[id]) for id in vtxArray]
+
+        if self.bake_node_id_dict:
             self.om_bake_skin_weight()
-            
+
         cmds.delete(temp_nodes)
         
     def om_bake_skin_weight(self, realbake=True, ignoreundo=False):

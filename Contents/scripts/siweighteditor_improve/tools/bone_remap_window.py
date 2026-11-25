@@ -303,7 +303,7 @@ class BoneRemapWindow(qt.SubWindow):
         self.setWindowTitle(self.WINDOW_TITLE)
         self.setObjectName(self.WINDOW_OBJECT_NAME)
         self.setAttribute(Qt.WA_DeleteOnClose)
-        self.resize(700, 520)
+        self.resize(700, 585)
 
         self._source_entries = []
         self._target_joints = []
@@ -329,6 +329,26 @@ class BoneRemapWindow(qt.SubWindow):
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(8, 8, 8, 8)
         main_layout.setSpacing(6)
+
+        # ツールの概要・使い方の案内
+        self.guide_label = QLabel(
+            lang.Lang(
+                en=(
+                    "Move weights from source bone(s) on the left to a destination bone on the right, "
+                    "or add a new bone's weight onto selected vertices.\n"
+                    "Use 'Lock Target' to keep the current vertices fixed while picking another vertex/bone in the viewport."
+                ),
+                ja=(
+                    u"左の「変更元ボーン」のウェイトを右の「変更先ボーン」へ一括移動したり、"
+                    u"選択頂点へ別ボーンのウェイトを追加できます。\n"
+                    u"「対象を固定」を ON にすると、作業対象の頂点を保持したままビューポートで別の頂点やボーンを選んで移動先を指定できます。"
+                ),
+            ).output()
+        )
+        self.guide_label.setWordWrap(True)
+        qt.change_button_color(self.guide_label, textColor=[218, 224, 232], bgColor=[46, 50, 58])
+        self.guide_label.setMargin(6)
+        main_layout.addWidget(self.guide_label)
 
         # 上部ステータスバー（現在の対象モードと対象固定ボタン）
         top_layout = QHBoxLayout()

@@ -130,13 +130,8 @@ class ClusterCopy():
             except Exception as e:
                 print('{}'.format(e))
                 try:
-                    cmds.delete(cls)
-                    cmds.undo()
-                    vertices = self._get_cluster_vertices(cls, mesh)
-                    if not vertices:
-                        continue
-                    cmds.select(vertices, r=True)
-                    weights = cmds.percent(cls, q=True, v=True) or []
+                    # Undo チャンクを壊さないよう削除・Undo は行わず、頂点指定クエリで再取得する
+                    weights = cmds.percent(cls, vertices, q=True, v=True) or []
                 except Exception as retry_e:
                     print('{}'.format(retry_e))
                     continue

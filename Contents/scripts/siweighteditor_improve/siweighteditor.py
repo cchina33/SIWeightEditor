@@ -29,16 +29,22 @@ from . import smooth_setting_editor
 from .viewport import bone_visualizer
 from .viewport import joint_display_helper
 from .tools import rig_cleanup_helper
+from .tools import reference_joint_helper
+from .tools import bone_picker_window
 from .tools import bone_remap_window
 from .tools import model_edit_window
+from .tools import unweighted_bind_window
 
 reload(smooth_setting_editor)
 reload(prof)
 reload(bone_visualizer)
 reload(joint_display_helper)
 reload(rig_cleanup_helper)
+reload(reference_joint_helper)
+reload(bone_picker_window)
 reload(bone_remap_window)
 reload(model_edit_window)
+reload(unweighted_bind_window)
 
 if MAYA_VER >= 2025:
     from PySide6.QtWidgets import *
@@ -116,40 +122,74 @@ select_job = None
 select_job_ids = set()
 
 
-class OptionWindow():
-    """非ドッキング時の SIWeightEditor Improve ウィンドウ起動クラス。"""
+def _get_window_save_file_path():
+    """ウィンドウ設定 JSON ファイルの保存パスを返す。"""
+    base_dir = os.getenv('MAYA_APP_DIR') or os.path.expanduser('~')
+    return os.path.join(base_dir, 'Scripting_Files', 'siweighteditor_improve_window.json')
 
-    def __init__(self, offset=False):
-        global WINDOW
+
+def _load_saved_dockable_flag():
+    """ウィンドウを生成する前に保存済み JSON から dockable 設定だけを読み込む。"""
+    save_file = _get_window_save_file_path()
+    if not os.path.exists(save_file):
+        return False
+    try:
+        with open(save_file, 'r') as fp:
+            data = json.load(fp)
+        return bool(data.get('dockable', False))
+    except Exception:
+        return False
+
+
+def _close_existing_windows():
+    """既存の SIWeightEditor Improve ウィンドウおよび残存 workspaceControl を 1 回で安全に閉じる。"""
+    global WINDOW
+    if WINDOW is not None:
         try:
-            WINDOW.closeEvent(None)
+            WINDOW.save_flag = False
             WINDOW.close()
         except Exception:
             pass
+        WINDOW = None
+    get_ui(WINDOW_OBJECT_NAME, "WeightEditorImproveWindow")
+    try:
+        ws_ctrl = WINDOW_OBJECT_NAME + "WorkspaceControl"
+        if cmds.workspaceControl(ws_ctrl, exists=True):
+            cmds.deleteUI(ws_ctrl)
+    except Exception:
+        pass
+
+
+class OptionWindow():
+    """非ドッキング時の SIWeightEditor Improve ウィンドウ起動クラス（1 回でスムーズに起動）。"""
+
+    def __init__(self, offset=False):
+        global WINDOW
+        _close_existing_windows()
         maya_win = qt.get_maya_window()
         WINDOW = WeightEditorImproveWindow(parent=maya_win)
         editor_state.set_window(WINDOW)
-        WINDOW.init_flag = False
+        WINDOW.setWindowFlag(Qt.Window, True)
+
         if WINDOW.dockable or offset:
             pos_x, pos_y = _clamp_window_position(WINDOW.pw - 8, WINDOW.ph - 31, WINDOW.sw, WINDOW.sh)
         else:
             pos_x, pos_y = _clamp_window_position(WINDOW.pw, WINDOW.ph, WINDOW.sw, WINDOW.sh)
-        WINDOW.move(pos_x, pos_y)
-        # ウィンドウ幅が狭くても正しくボタン再配置できるように大きいサイズから縮めておく
-        for i in range(0, 800, 50):
-            WINDOW.resize(1000 - i, 800)
+
+        WINDOW.init_flag = False
         WINDOW.resize(WINDOW.sw, WINDOW.sh)
-        WINDOW.show(
-            dockable=WINDOW.dockable,
-            area=WINDOW.area,
-            floating=WINDOW.floating,
-            width=WINDOW.sw,
-            height=WINDOW.sh,
-        )
-        if not WINDOW.dockable:
-            _ensure_maya_owned_floating_window(WINDOW)
-            WINDOW.move(pos_x, pos_y)
-            WINDOW.resize(WINDOW.sw, WINDOW.sh)
+        WINDOW.move(pos_x, pos_y)
+        # 表示前に最終サイズでボタン配置を 1 回だけ適用してチラつきを防ぐ
+        try:
+            WINDOW.re_arrangement_but(win_x=WINDOW.sw, grid_v=0, but_list=WINDOW.but_list, loop=0, layout=WINDOW.unique_layout)
+            WINDOW.re_arrangement_but(win_x=WINDOW.sw, grid_v=0, but_list=WINDOW.but_list3, loop=0, layout=WINDOW.unique_layout3)
+            WINDOW.re_arrangement_but(win_x=WINDOW.sw, grid_v=0, but_list=WINDOW.but_list2, loop=0, layout=WINDOW.unique_layout2)
+        except Exception:
+            pass
+
+        # 非ドッキング時は QMainWindow.show を直接 1 回だけ呼び、Mixin の余計な再生成を防ぐ
+        QMainWindow.show(WINDOW)
+        _ensure_maya_owned_floating_window(WINDOW)
 
 
 class WeightEditorImproveWindow(
@@ -342,7 +382,6 @@ class WeightEditorImproveWindow(
         self.setAttribute(Qt.WA_DeleteOnClose)
         self.init_save()
         self.wdata = self.load_window_data()
-        self.setAttribute(Qt.WA_DeleteOnClose)
         self.icon_path = os.path.join(os.path.dirname(__file__), 'icons/')
         #OpenMayaでウェイト取得するクラスをインスタンス化
         self.store_skin_weight = store_skin_weight.StoreSkinWeight()
@@ -395,6 +434,11 @@ class WeightEditorImproveWindow(
     def closeEvent(self, e):
         #print('window closed :')
         debug_log('closeEvent start')
+        if hasattr(self, '_reset_slider_drag_state'):
+            try:
+                self._reset_slider_drag_state()
+            except Exception:
+                pass
         self.closed_flag=True
         self.remove_job()
         try:
@@ -417,6 +461,18 @@ class WeightEditorImproveWindow(
             except Exception:
                 pass
             self.model_edit_window = None
+        if getattr(self, 'joint_search_dialog', None) is not None:
+            try:
+                self.joint_search_dialog.close()
+            except Exception:
+                pass
+            self.joint_search_dialog = None
+        if getattr(self, 'bone_picker_window', None) is not None:
+            try:
+                self.bone_picker_window.close()
+            except Exception:
+                pass
+            self.bone_picker_window = None
         self.erase_func_data()
         self.remove_job()
         if self.save_flag:
@@ -491,26 +547,134 @@ class WeightEditorImproveWindow(
             pass
 
 
-# アンドゥ時に辞書を更新しておく（bake_skin_weight_improve.py 向け公開 API）
-def update_dict(node_weight_dict, node_id_dict):
+def _get_live_window():
+    """現在開いていて安全に操作可能なメインウィンドウを返す（閉鎖・破棄済みなら None）。"""
     win = editor_state.WINDOW or WINDOW
-    for node, new_weight_list in node_weight_dict.items():
-        node_v_id_list = node_id_dict[node]
+    if win is None or getattr(win, "closed_flag", False):
+        return None
+    try:
+        if hasattr(qt, "shiboken") and not qt.shiboken.isValid(win):
+            return None
+    except Exception:
+        pass
+    return win
+
+
+# アンドゥ・リドゥ時に辞書を更新しておく（bake_skin_weight_improve.py 向け公開 API）
+def update_dict(node_weight_dict, node_id_dict):
+    win = _get_live_window()
+    if win is None or not hasattr(win, "node_weight_dict"):
+        return
+    for node, new_weight_list in (node_weight_dict or {}).items():
+        if node not in win.node_weight_dict:
+            continue
+        target_list = win.node_weight_dict[node]
+        node_v_id_list = (node_id_dict or {}).get(node)
+        if node_v_id_list is None:
+            continue
         for vid, new_weight in zip(node_v_id_list, new_weight_list):
-            win.node_weight_dict[node][vid] = new_weight
+            if 0 <= vid < len(target_list):
+                target_list[vid] = list(new_weight)
 
 
 def reverse_dict(node_weight_dict, node_id_dict):
-    win = editor_state.WINDOW or WINDOW
-    for node, old_weight_list in node_weight_dict.items():
-        win.node_weight_dict[node] = old_weight_list
+    win = _get_live_window()
+    if win is None or not hasattr(win, "node_weight_dict"):
+        return
+    for node, old_weight_list in (node_weight_dict or {}).items():
+        if node not in win.node_weight_dict:
+            continue
+        target_list = win.node_weight_dict[node]
+        node_v_id_list = (node_id_dict or {}).get(node)
+        if node_v_id_list is None:
+            continue
+        for vid, old_weight in zip(node_v_id_list, old_weight_list):
+            if 0 <= vid < len(target_list):
+                target_list[vid] = list(old_weight)
+
+
+def _capture_selected_cell_keys(win):
+    """テーブル再構築前に選択セルを (ノード名, 頂点ID, インフルエンス名) 集合として記憶する。"""
+    keys = []
+    sel_items = getattr(win, "selected_items", None) or []
+    vtx_row_dict = getattr(win, "vtx_row_dict", None) or {}
+    all_infs = getattr(win, "all_influences", None) or []
+    for idx in sel_items:
+        try:
+            row = idx.row()
+            col = idx.column()
+        except Exception:
+            continue
+        row_info = vtx_row_dict.get(row)
+        if row_info is None or not (0 <= col < len(all_infs)):
+            continue
+        keys.append((row_info[6], row_info[0], all_infs[col]))
+    return keys
+
+
+def _restore_selected_cell_keys(win, cell_keys):
+    """記憶していた (ノード名, 頂点ID, インフルエンス名) のセル選択をテーブルへ復元する。"""
+    if not cell_keys:
+        return False
+    vtx_row_dict = getattr(win, "vtx_row_dict", None) or {}
+    inf_col_dict = getattr(win, "inf_column_dict", None) or {}
+    sel_model = getattr(win, "sel_model", None)
+    weight_model = getattr(win, "weight_model", None)
+    if sel_model is None or weight_model is None:
+        return False
+
+    node_vid_to_row = {}
+    for row, row_info in vtx_row_dict.items():
+        node_vid_to_row[(row_info[6], row_info[0])] = row
+
+    selection = QItemSelection()
+    first_index = None
+    for node, vid, inf_name in cell_keys:
+        row = node_vid_to_row.get((node, vid))
+        col = inf_col_dict.get(inf_name)
+        if row is None or col is None:
+            continue
+        model_idx = weight_model.index(row, col)
+        if not model_idx.isValid():
+            continue
+        selection.select(model_idx, model_idx)
+        if first_index is None:
+            first_index = model_idx
+
+    if selection.isEmpty() or first_index is None:
+        return False
+
+    win._restoring_bone_selection = True
+    try:
+        sel_model.setCurrentIndex(first_index, QItemSelectionModel.NoUpdate)
+        sel_model.select(selection, QItemSelectionModel.ClearAndSelect)
+    finally:
+        win._restoring_bone_selection = False
+    return True
 
 
 def refresh_window():
-    win = editor_state.WINDOW or WINDOW
-    win.reset_hilite(force_reset=True)
-    win.get_set_skin_weight(undo=True)
-    win.weight_input.setValue(0.0)
+    win = _get_live_window()
+    if win is None:
+        return
+    if hasattr(win, "_reset_slider_drag_state"):
+        win._reset_slider_drag_state()
+    prev_cells = _capture_selected_cell_keys(win)
+    try:
+        win.reset_hilite(force_reset=True)
+    except Exception:
+        pass
+    try:
+        win.get_set_skin_weight(undo=True)
+    except Exception:
+        return
+    restored = _restore_selected_cell_keys(win, prev_cells)
+    if not restored:
+        try:
+            win.change_add_mode(win.add_mode, change_only=True)
+        except Exception:
+            if hasattr(win, "_set_slider_and_spinbox_silent"):
+                win._set_slider_and_spinbox_silent(0.0)
 
 
 def set_current_data(node_id, node_weight, node_inf, node_skin, undo_node_dict, redo_node_dict, org_node_dict):
@@ -524,10 +688,13 @@ def get_current_data():
 
 
 def get_ui(name, weight_type):
-    all_ui = {w.objectName(): w for w in QApplication.allWidgets()}
-    for k, v in all_ui.items():
-        if v.__class__.__name__ == weight_type:
-            v.close()
+    for widget in list(QApplication.topLevelWidgets() or []):
+        try:
+            if widget.__class__.__name__ == weight_type or widget.objectName() == name:
+                widget.save_flag = False
+                widget.close()
+        except Exception:
+            pass
 
 
 def make_ui():
@@ -542,42 +709,35 @@ def make_ui():
 
 def Option(x=None, y=None):
     global WINDOW
-    try:
-        WINDOW.dockCloseEventTriggered()
-        WINDOW.save_flag = False
-        WINDOW.close()
-    except Exception:
-        pass
-    if MAYA_VER <= 2016:
+    # 非ドッキング設定の場合はダミーウィンドウを作らず、直接 1 回だけ起動する
+    if MAYA_VER <= 2016 or not _load_saved_dockable_flag():
         OptionWindow()
         return
+
+    _close_existing_windows()
     window = make_ui()
-    save_data = window.load_window_data(init_pos=False)
+    save_data = window.wdata or window.load_window_data(init_pos=False)
 
-    try:
-        cmds.deleteUI(WINDOW_OBJECT_NAME + "WorkspaceControl")
-    except Exception:
-        pass
-
-    if not save_data["dockable"]:
+    if not save_data.get("dockable", False):
         window.save_flag = False
         window.close()
         OptionWindow()
         return
+
     WINDOW = window
     editor_state.set_window(WINDOW)
 
     if save_data:
-        width = save_data["sw"]
-        height = save_data["sh"]
+        width = save_data.get("sw")
+        height = save_data.get("sh")
     else:
         width = None
         height = None
 
     ui_script = "import siweighteditor_improve.siweighteditor;siweighteditor_improve.siweighteditor.restoration_workspacecontrol()"
     opts = {
-        "scriptjob": save_data["scriptjob"],
-        "dockable": save_data["dockable"],
+        "scriptjob": save_data.get("scriptjob", True),
+        "dockable": save_data.get("dockable", True),
         "floating": True,
         "area": None,
         "allowedArea": None,

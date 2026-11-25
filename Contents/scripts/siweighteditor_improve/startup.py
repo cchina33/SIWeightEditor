@@ -99,22 +99,23 @@ def register_siwieighteditor_runtime_command():
     register_runtime_command(opts)
 
 
+_STARTUP_EXECUTED = False
+
+
 def jpn(string):
-    # type: (str) -> str
-    """encode utf8 into cp932"""
-
+    # Python 3 環境ではそのまま文字列を返し、Python 2 環境のみ cp932 へ変換する
     try:
-        string = unicode(string, "utf-8")
-        string = string.encode("cp932")
+        if isinstance(string, bytes):
+            return string.decode("utf-8").encode("cp932")
         return string
-
     except Exception:
         return string
 
-def execute():
+
+def execute(force=False):
+    global _STARTUP_EXECUTED
+    if _STARTUP_EXECUTED and not force:
+        return
+    _STARTUP_EXECUTED = True
     menu_setup()
-    #今のところコマンド登録しない
     register_siwieighteditor_runtime_command()
-    # 2017以降ではworkspaceControlがあるので記録と復元は必要ない
-    #if int(cmds.about(v=True)[:4]) < 2017:
-        #maya.utils.executeDeferred(sisidebar_main.load_with_start_up)

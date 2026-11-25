@@ -218,18 +218,11 @@ def clamp_window_position(x, y, width, height):
 
 
 def ensure_maya_owned_floating_window(win):
-    """非ドッキング時のメインウィンドウが Maya 本体より背面へ回らないようオーナー関係を保証する。"""
-    maya_win = qt.get_maya_window()
-    if maya_win is None or win is None:
+    """非ドッキング時のメインウィンドウが Maya 本体より背面へ回らないよう再生成なしでオーナー関係を保証する。"""
+    if win is None:
         return
     try:
-        if win.parent() is not maya_win:
-            pos = win.pos()
-            size = win.size()
-            win.setParent(maya_win, Qt.Window)
-            win.resize(size)
-            win.move(pos)
-            win.show()
+        qt.attach_maya_window_owner(win)
         win.raise_()
         win.activateWindow()
     except Exception:

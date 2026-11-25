@@ -1,9 +1,16 @@
-# # -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 
+import os
+import sys
 import maya.cmds as cmds
 
 
 def __register_siweighteditor_improve_startup():
+    # ApplicationPlugins の PackageContents.xml と PYTHONPATH の両方から二重実行されるのを防ぐ
+    if os.environ.get("SIWE_IMPROVE_USERSETUP_REGISTERED") == "1":
+        return
+    os.environ["SIWE_IMPROVE_USERSETUP_REGISTERED"] = "1"
+
     from textwrap import dedent
     cmds.evalDeferred(dedent(
         """

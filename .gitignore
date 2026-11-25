@@ -1,15 +1,38 @@
-# Python キャッシュ
+# Python キャッシュ・テスト・ビルド生成物
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+*.egg-info/
 
-# ローカル作業ドキュメント・ログ
+# ローカル作業ドキュメント・ログ・環境設定
 ai-task-docs/
 *.log
+.env
+.env.*
 
-# OS・エディタ一時ファイル
+# 一時ファイル・バックアップ・Maya / ツール生成データ
+*.bak
+*.tmp
+*.orig
+*.swp
+*.swo
+*~
+.mayaSwatches/
+*.swatches
+_joint_pose_backups/
+_last_joint_cache.json
+siweighteditor_improve_model_edit/
+siwe_improve_debug.log
+
+# OS・エディタ・AI 作業ディレクトリ
 .DS_Store
 Thumbs.db
 Desktop.ini
 .vscode/
 .idea/
+.cursor/
+.gemini/

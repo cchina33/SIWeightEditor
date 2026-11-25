@@ -10,16 +10,18 @@ import maya.api.OpenMaya as om2
 WEIGHT_EPSILON = 0.0001
 MAX_TARGET_VERTICES = 5000
 REMAP_HIGHLIGHT_RGB = (1.00, 0.15, 0.95)
+PICKER_HIGHLIGHT_RGB = (0.15, 0.95, 1.00)
 
 _SAVED_COLOR_ATTRS = {}
 _SAVED_DRAW_STYLE = {}
 _SKELETON_CACHE_KEY = None
 _SKELETON_CACHE_JOINTS = set()
 _REMAP_HIGHLIGHT_JOINT = None
+_PICKER_HIGHLIGHT_JOINTS = set()
 
 _SCENE_CALLBACK_IDS = []
 _ACTIVE_WINDOW = None
-_SAVED_BEFORE_SAVE_FLAGS = (False, False, None)
+_SAVED_BEFORE_SAVE_FLAGS = (False, False, None, set())
 
 
 def _resolve_long_name_cached(node_name, cache):
@@ -305,20 +307,37 @@ def _restore_single_joint_color(joint, saved):
             _safe_set_attr(joint + "." + attr_name, val)
 
 
+def _resolve_existing_joint_set(joint_paths):
+    """指定されたジョイント群のうちシーンに存在するフルパス集合を返す。"""
+    resolved = set()
+    for jp in (joint_paths or []):
+        full = _resolve_existing_joint_long(jp)
+        if full:
+            resolved.add(full)
+    return resolved
+
+
 def restore_joint_colors(keep_remap=False, use_maya_wire=True):
-    """退避したジョイントのカラー設定を元の状態へ復元する（必要に応じて Remap 変更先のみ維持）。"""
+    """退避したジョイントのカラー設定を元の状態へ復元する（必要時は Remap / Picker ハイライトを維持）。"""
     remap_joint = _resolve_existing_joint_long(_REMAP_HIGHLIGHT_JOINT) if keep_remap else None
-    if not _SAVED_COLOR_ATTRS and not remap_joint:
+    picker_joints = _resolve_existing_joint_set(_PICKER_HIGHLIGHT_JOINTS) if keep_remap else set()
+    keep_set = set(picker_joints)
+    if remap_joint:
+        keep_set.add(remap_joint)
+    if not _SAVED_COLOR_ATTRS and not keep_set:
         return
 
     prev_undo = cmds.undoInfo(query=True, stateWithoutFlush=True)
     cmds.undoInfo(stateWithoutFlush=False)
     try:
         for joint in list(_SAVED_COLOR_ATTRS.keys()):
-            if remap_joint and joint == remap_joint:
+            if joint in keep_set:
                 continue
             saved = _SAVED_COLOR_ATTRS.pop(joint)
             _restore_single_joint_color(joint, saved)
+        for p_joint in picker_joints:
+            if p_joint != remap_joint:
+                _apply_joint_rgb(p_joint, PICKER_HIGHLIGHT_RGB, use_maya_wire=use_maya_wire)
         if remap_joint:
             _apply_joint_rgb(remap_joint, REMAP_HIGHLIGHT_RGB, use_maya_wire=use_maya_wire)
     finally:
@@ -326,19 +345,21 @@ def restore_joint_colors(keep_remap=False, use_maya_wire=True):
 
 
 def update_joint_hilite(window, maya_ver=2025):
-    """Joint Hilite（選択列強調／頂点ウェイト・ヒートマップ）および Remap 変更先ハイライトを更新する。"""
+    """Joint Hilite（選択列強調／頂点ウェイト・ヒートマップ）および Remap / Picker ハイライトを更新する。"""
     global _ACTIVE_WINDOW
     if window is not None:
         _ACTIVE_WINDOW = window
     win = _ACTIVE_WINDOW
     use_wire = maya_ver >= 2016
     remap_joint = _resolve_existing_joint_long(_REMAP_HIGHLIGHT_JOINT)
+    picker_joints = _resolve_existing_joint_set(_PICKER_HIGHLIGHT_JOINTS)
+    has_special = bool(remap_joint or picker_joints)
     enabled = bool(win is not None and hasattr(win, "joint_hl_but") and win.joint_hl_but.isChecked())
 
     if not enabled:
-        if remap_joint:
+        if has_special:
             register_scene_callbacks()
-        restore_joint_colors(keep_remap=bool(remap_joint), use_maya_wire=use_wire)
+        restore_joint_colors(keep_remap=has_special, use_maya_wire=use_wire)
         return
 
     register_scene_callbacks()
@@ -346,6 +367,8 @@ def update_joint_hilite(window, maya_ver=2025):
     all_bound = set(ctx["all_bound_joints"])
     if remap_joint:
         all_bound.add(remap_joint)
+    if picker_joints:
+        all_bound.update(picker_joints)
 
     if not all_bound:
         restore_joint_colors(keep_remap=False, use_maya_wire=use_wire)
@@ -364,22 +387,26 @@ def update_joint_hilite(window, maya_ver=2025):
                 _restore_single_joint_color(old_joint, _SAVED_COLOR_ATTRS.pop(old_joint))
 
         if mode == "selected":
-            # Remap 変更先を最優先でマゼンタ、選択列を黄色で強調し、それ以外は元の色を維持する
+            # Remap マゼンタ・Picker シアン・選択列イエローで強調し、それ以外は元の色を維持する
             for joint in all_bound:
                 if remap_joint and joint == remap_joint:
                     _apply_joint_rgb(joint, REMAP_HIGHLIGHT_RGB, use_maya_wire=use_wire)
+                elif joint in picker_joints:
+                    _apply_joint_rgb(joint, PICKER_HIGHLIGHT_RGB, use_maya_wire=use_wire)
                 elif joint in selected_cols:
                     _apply_joint_rgb(joint, (1.0, 0.95, 0.25), use_maya_wire=use_wire)
                 elif joint in _SAVED_COLOR_ATTRS:
                     _restore_single_joint_color(joint, _SAVED_COLOR_ATTRS.pop(joint))
         else:
-            # 頂点ウェイト・ヒートマップ：Remap 変更先を最優先マゼンタ、選択列は黄、ウェイトありはヒートマップ
+            # 頂点ウェイト・ヒートマップ：Remap マゼンタ・Picker シアン・選択列黄・ウェイトヒートマップ
             if ctx["too_many"] and not selected_cols:
-                restore_joint_colors(keep_remap=bool(remap_joint), use_maya_wire=use_wire)
+                restore_joint_colors(keep_remap=has_special, use_maya_wire=use_wire)
                 return
             for joint in all_bound:
                 if remap_joint and joint == remap_joint:
                     _apply_joint_rgb(joint, REMAP_HIGHLIGHT_RGB, use_maya_wire=use_wire)
+                elif joint in picker_joints:
+                    _apply_joint_rgb(joint, PICKER_HIGHLIGHT_RGB, use_maya_wire=use_wire)
                 elif joint in selected_cols:
                     _apply_joint_rgb(joint, (1.0, 1.0, 0.20), use_maya_wire=use_wire)
                 elif joint in weighted_map:
@@ -391,30 +418,34 @@ def update_joint_hilite(window, maya_ver=2025):
 
 
 def restore_used_joints(keep_remap=False):
-    """退避したジョイントの drawStyle 設定を元の状態へ復元する（必要時は Remap 変更先の可視性を維持）。"""
+    """退避したジョイントの drawStyle 設定を元の状態へ復元する（必要時は Remap / Picker 対象を維持）。"""
     remap_joint = _resolve_existing_joint_long(_REMAP_HIGHLIGHT_JOINT) if keep_remap else None
-    if not _SAVED_DRAW_STYLE and not remap_joint:
+    picker_joints = _resolve_existing_joint_set(_PICKER_HIGHLIGHT_JOINTS) if keep_remap else set()
+    keep_set = set(picker_joints)
+    if remap_joint:
+        keep_set.add(remap_joint)
+    if not _SAVED_DRAW_STYLE and not keep_set:
         return
 
     prev_undo = cmds.undoInfo(query=True, stateWithoutFlush=True)
     cmds.undoInfo(stateWithoutFlush=False)
     try:
         for joint in list(_SAVED_DRAW_STYLE.keys()):
-            if remap_joint and joint == remap_joint:
+            if joint in keep_set:
                 continue
             orig_style = _SAVED_DRAW_STYLE.pop(joint)
             if cmds.objExists(joint):
                 _safe_set_attr(joint + ".drawStyle", orig_style)
 
-        if remap_joint:
-            attr = remap_joint + ".drawStyle"
-            if remap_joint not in _SAVED_DRAW_STYLE:
+        for target_j in keep_set:
+            attr = target_j + ".drawStyle"
+            if target_j not in _SAVED_DRAW_STYLE:
                 orig_val = _safe_get_attr(attr)
                 if orig_val == 2:
-                    _SAVED_DRAW_STYLE[remap_joint] = orig_val
+                    _SAVED_DRAW_STYLE[target_j] = orig_val
                     _safe_set_attr(attr, 0)
             else:
-                orig_val = _SAVED_DRAW_STYLE.get(remap_joint, 0)
+                orig_val = _SAVED_DRAW_STYLE.get(target_j, 0)
                 _safe_set_attr(attr, 0 if orig_val == 2 else orig_val)
     finally:
         cmds.undoInfo(stateWithoutFlush=prev_undo)
@@ -427,18 +458,20 @@ def update_used_joints(window):
         _ACTIVE_WINDOW = window
     win = _ACTIVE_WINDOW
     remap_joint = _resolve_existing_joint_long(_REMAP_HIGHLIGHT_JOINT)
+    picker_joints = _resolve_existing_joint_set(_PICKER_HIGHLIGHT_JOINTS)
+    has_special = bool(remap_joint or picker_joints)
     enabled = bool(win is not None and hasattr(win, "used_joint_vis_but") and win.used_joint_vis_but.isChecked())
 
     if not enabled:
-        if remap_joint:
+        if has_special:
             register_scene_callbacks()
-        restore_used_joints(keep_remap=bool(remap_joint))
+        restore_used_joints(keep_remap=has_special)
         return
 
     register_scene_callbacks()
     ctx = collect_joint_display_context(win)
     if ctx["too_many"]:
-        restore_used_joints(keep_remap=bool(remap_joint))
+        restore_used_joints(keep_remap=has_special)
         if hasattr(win, "set_message"):
             win.set_message(
                 msg="- Used Joints skipped : too many vertices ({0}) -".format(ctx["row_count"]),
@@ -451,15 +484,18 @@ def update_used_joints(window):
     if remap_joint:
         used_joints.add(remap_joint)
         all_bound.add(remap_joint)
+    if picker_joints:
+        used_joints.update(picker_joints)
+        all_bound.update(picker_joints)
 
     if not all_bound or not used_joints:
-        restore_used_joints(keep_remap=bool(remap_joint))
+        restore_used_joints(keep_remap=has_special)
         return
 
     mode = getattr(win, "used_joints_mode", "exact")
     keep_joints = set(used_joints)
     if mode == "with_children":
-        # 骨の三角錐形状を保つため使用ボーンおよび Remap 変更先ボーンの直下の子 1 階層を追加表示する
+        # 骨の三角錐形状を保つため使用ボーンおよび強調ボーンの直下の子 1 階層を追加表示する
         for joint in list(used_joints):
             if not cmds.objExists(joint):
                 continue
@@ -468,9 +504,10 @@ def update_used_joints(window):
                 keep_joints.update(children)
             except Exception:
                 pass
-    elif remap_joint:
-        # exact モードでも Remap 変更先ボーンの向きが視認しやすいよう本体は確実に表示する
-        keep_joints.add(remap_joint)
+    else:
+        if remap_joint:
+            keep_joints.add(remap_joint)
+        keep_joints.update(picker_joints)
 
     target_joints = set(_collect_skeleton_joints_cached(all_bound))
     target_joints.update(keep_joints)
@@ -530,10 +567,32 @@ def clear_remap_target_highlight(window=None, maya_ver=2025):
     set_remap_target_highlight(None, window=window, maya_ver=maya_ver)
 
 
+def set_picker_highlight_joints(joint_paths, window=None, maya_ver=2025):
+    """ボーンピッカー選択中のボーン群をビューポート上でハイライト表示する。"""
+    global _PICKER_HIGHLIGHT_JOINTS, _ACTIVE_WINDOW
+    if window is not None:
+        _ACTIVE_WINDOW = window
+    _PICKER_HIGHLIGHT_JOINTS = _resolve_existing_joint_set(joint_paths)
+    if _PICKER_HIGHLIGHT_JOINTS:
+        register_scene_callbacks()
+    update_joint_hilite(_ACTIVE_WINDOW, maya_ver=maya_ver)
+    update_used_joints(_ACTIVE_WINDOW)
+
+
+def clear_picker_highlight_joints(window=None, maya_ver=2025):
+    """ボーンピッカーによるビューポートハイライトを解除する。"""
+    set_picker_highlight_joints([], window=window, maya_ver=maya_ver)
+
+
 def _on_before_save(*args):
     """シーン保存前にジョイントの色・表示スタイルを一時的に元の状態へ戻す。"""
     global _SAVED_BEFORE_SAVE_FLAGS
-    _SAVED_BEFORE_SAVE_FLAGS = (bool(_SAVED_COLOR_ATTRS), bool(_SAVED_DRAW_STYLE), _REMAP_HIGHLIGHT_JOINT)
+    _SAVED_BEFORE_SAVE_FLAGS = (
+        bool(_SAVED_COLOR_ATTRS),
+        bool(_SAVED_DRAW_STYLE),
+        _REMAP_HIGHLIGHT_JOINT,
+        set(_PICKER_HIGHLIGHT_JOINTS),
+    )
     if _SAVED_COLOR_ATTRS:
         restore_joint_colors(keep_remap=False)
     if _SAVED_DRAW_STYLE:
@@ -541,20 +600,21 @@ def _on_before_save(*args):
 
 
 def _on_after_save(*args):
-    """シーン保存後に必要に応じて Joint Hilite / Used Joints / Remap ハイライトを再適用する。"""
-    global _SAVED_BEFORE_SAVE_FLAGS, _REMAP_HIGHLIGHT_JOINT
-    restore_hl, restore_used, saved_remap = _SAVED_BEFORE_SAVE_FLAGS
-    _SAVED_BEFORE_SAVE_FLAGS = (False, False, None)
+    """シーン保存後に必要に応じて Joint Hilite / Used Joints / Remap / Picker ハイライトを再適用する。"""
+    global _SAVED_BEFORE_SAVE_FLAGS, _REMAP_HIGHLIGHT_JOINT, _PICKER_HIGHLIGHT_JOINTS
+    restore_hl, restore_used, saved_remap, saved_picker = _SAVED_BEFORE_SAVE_FLAGS
+    _SAVED_BEFORE_SAVE_FLAGS = (False, False, None, set())
     _REMAP_HIGHLIGHT_JOINT = _resolve_existing_joint_long(saved_remap)
+    _PICKER_HIGHLIGHT_JOINTS = _resolve_existing_joint_set(saved_picker)
     win = _ACTIVE_WINDOW
     if win is not None and getattr(win, "closed_flag", False):
         return
-    if restore_hl or _REMAP_HIGHLIGHT_JOINT:
+    if restore_hl or _REMAP_HIGHLIGHT_JOINT or _PICKER_HIGHLIGHT_JOINTS:
         try:
             update_joint_hilite(win)
         except Exception:
             pass
-    if restore_used or _REMAP_HIGHLIGHT_JOINT:
+    if restore_used or _REMAP_HIGHLIGHT_JOINT or _PICKER_HIGHLIGHT_JOINTS:
         try:
             update_used_joints(win)
         except Exception:
@@ -563,13 +623,15 @@ def _on_after_save(*args):
 
 def _on_scene_reset(*args):
     """新規シーンやシーン読み込み前に退避辞書とキャッシュを安全にクリアする。"""
-    global _SKELETON_CACHE_KEY, _SKELETON_CACHE_JOINTS, _SAVED_BEFORE_SAVE_FLAGS, _REMAP_HIGHLIGHT_JOINT
+    global _SKELETON_CACHE_KEY, _SKELETON_CACHE_JOINTS, _SAVED_BEFORE_SAVE_FLAGS
+    global _REMAP_HIGHLIGHT_JOINT, _PICKER_HIGHLIGHT_JOINTS
     _SAVED_COLOR_ATTRS.clear()
     _SAVED_DRAW_STYLE.clear()
     _SKELETON_CACHE_KEY = None
     _SKELETON_CACHE_JOINTS = set()
     _REMAP_HIGHLIGHT_JOINT = None
-    _SAVED_BEFORE_SAVE_FLAGS = (False, False, None)
+    _PICKER_HIGHLIGHT_JOINTS = set()
+    _SAVED_BEFORE_SAVE_FLAGS = (False, False, None, set())
 
 
 def register_scene_callbacks():
@@ -603,12 +665,14 @@ def unregister_scene_callbacks():
 
 def cleanup():
     """ウィンドウ終了時やアンロード時に元のジョイント状態へ復元してコールバックを解除する。"""
-    global _ACTIVE_WINDOW, _SKELETON_CACHE_KEY, _SKELETON_CACHE_JOINTS, _SAVED_BEFORE_SAVE_FLAGS, _REMAP_HIGHLIGHT_JOINT
+    global _ACTIVE_WINDOW, _SKELETON_CACHE_KEY, _SKELETON_CACHE_JOINTS, _SAVED_BEFORE_SAVE_FLAGS
+    global _REMAP_HIGHLIGHT_JOINT, _PICKER_HIGHLIGHT_JOINTS
     _REMAP_HIGHLIGHT_JOINT = None
+    _PICKER_HIGHLIGHT_JOINTS = set()
     restore_joint_colors(keep_remap=False)
     restore_used_joints(keep_remap=False)
     unregister_scene_callbacks()
     _ACTIVE_WINDOW = None
     _SKELETON_CACHE_KEY = None
     _SKELETON_CACHE_JOINTS = set()
-    _SAVED_BEFORE_SAVE_FLAGS = (False, False, None)
+    _SAVED_BEFORE_SAVE_FLAGS = (False, False, None, set())

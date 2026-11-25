@@ -2,6 +2,8 @@
 """SIWeightEditor Improve のデータ読込・テーブル更新・選択連動・Keep Bone・サブウィンドウ連携 Mixin。"""
 
 import copy
+import fnmatch
+import re
 from collections import defaultdict
 
 from maya import cmds
@@ -12,6 +14,7 @@ from .. import lang
 from .. import qt
 from ..viewport import bone_visualizer
 from ..viewport import joint_display_helper
+from ..tools import bone_picker_window
 from ..tools import bone_remap_window
 from ..tools import model_edit_window
 from ..qt import *
@@ -68,13 +71,12 @@ class EditorViewControllerMixin(object):
         if self.interactive_but.isChecked() and not as_interractive:
             debug_log('search_joint skip waiting interactive')
             return
-        if len(self.search_line.text()) == 0:
+        if len(self.search_line.text().strip()) == 0:
             self.search_joint_list = []
         else:
-            self.search_joint_list = self.search_line.text().split(' ')
-            self.search_joint_list  = [name for name in self.search_joint_list if name != '']
+            self.search_joint_list = [name for name in self.search_line.text().split(' ') if name != '']
         self.get_set_skin_weight()
-        
+
     def selection_has_polygon_target(self):
         selection = cmds.ls(sl=True, l=True) or []
         debug_log('selection_has_polygon_target selection_count={0} selection={1}'.format(len(selection), selection[:5]))
@@ -104,38 +106,266 @@ class EditorViewControllerMixin(object):
                         pass
         debug_log('selection_has_polygon_target result=False')
         return False
-        
-    def open_joint_search_dialog(self):
-        debug_log('open_joint_search_dialog start')
-        influences = []
+
+    @staticmethod
+    def _match_single_search_token(short_name, pattern):
+        """単一検索パターンとボーンのショートネームを照合する（=厳密一致・*ワイルドカード・部分一致対応）。"""
+        if not pattern:
+            return False
+        base_name = short_name.split(':')[-1]
+        short_upper = short_name.upper()
+        base_upper = base_name.upper()
+
+        # = またはダブルクォート囲みは厳密一致
+        exact = False
+        inner = pattern
+        if inner.startswith('='):
+            exact = True
+            inner = inner[1:]
+        elif len(inner) >= 2 and inner[0] == '"' and inner[-1] == '"':
+            exact = True
+            inner = inner[1:-1]
+        if not inner:
+            return False
+
+        inner_upper = inner.upper()
+        if exact:
+            return short_upper == inner_upper or base_upper == inner_upper
+        if '*' in inner_upper or '?' in inner_upper:
+            return fnmatch.fnmatchcase(short_upper, inner_upper) or fnmatch.fnmatchcase(base_upper, inner_upper)
+        return inner_upper in short_upper
+
+    def _match_influence_search(self, inf, query_tokens, require_positive=False):
+        """拡張検索クエリ（通常OR / +AND / -!除外 / =厳密一致 / *ワイルドカード）でインフルエンスを判定する。"""
+        if not query_tokens:
+            return not require_positive
+        short_name = inf.split('|')[-1]
+        or_tokens = []
+        and_tokens = []
+        not_tokens = []
+
+        for raw in query_tokens:
+            if not raw:
+                continue
+            if len(raw) > 1 and raw[0] in ('-', '!'):
+                not_tokens.append(raw[1:])
+            elif len(raw) > 1 and raw[0] == '+':
+                and_tokens.append(raw[1:])
+            else:
+                or_tokens.append(raw)
+
+        # 除外条件に該当すれば即対象外
+        for tok in not_tokens:
+            if self._match_single_search_token(short_name, tok):
+                return False
+
+        # 必須（AND）条件をすべて満たす必要がある
+        for tok in and_tokens:
+            if not self._match_single_search_token(short_name, tok):
+                return False
+
+        # Add モードでは除外条件だけのときに全ボーンが加算されないよう肯定条件を要求する
+        if require_positive and not or_tokens and not and_tokens:
+            return False
+
+        if or_tokens:
+            return any(self._match_single_search_token(short_name, tok) for tok in or_tokens)
+        return True
+
+    @staticmethod
+    def _flip_lr_in_token(token):
+        """検索トークン内の接頭辞（= / + / - / !）を保ったまま左右表記（L/R, Left/Right）を反転する。"""
+        prefix = ''
+        body = token
+        while body and body[0] in ('=', '+', '-', '!'):
+            prefix += body[0]
+            body = body[1:]
+        quote_wrapped = len(body) >= 2 and body[0] == '"' and body[-1] == '"'
+        if quote_wrapped:
+            body = body[1:-1]
+        if not body:
+            return token
+
+        # 単語境界や区切り文字単位で L⇔R / Left⇔Right を一時プレースホルダ経由で安全に反転
+        def _swap_word(match):
+            word = match.group(0)
+            lower = word.lower()
+            if lower == 'left':
+                if word.isupper():
+                    return 'RIGHT'
+                if word[0].isupper():
+                    return 'Right'
+                return 'right'
+            if lower == 'right':
+                if word.isupper():
+                    return 'LEFT'
+                if word[0].isupper():
+                    return 'Left'
+                return 'left'
+            if lower == 'l':
+                return 'R' if word.isupper() else 'r'
+            if lower == 'r':
+                return 'L' if word.isupper() else 'l'
+            return word
+
+        # キャメルケース含む Left⇔Right と区切り付き L⇔R を安全に反転
+        pattern = re.compile(
+            r'(?<=[a-z0-9_])(Left|Right)(?=[A-Z0-9_.]|$)'
+            r'|^(Left|Right)(?=[A-Z0-9_.]|$)'
+            r'|(?<![A-Za-z])(Left|Right|LEFT|RIGHT|left|right|L|R|l|r)(?![A-Za-z])'
+        )
+        flipped = pattern.sub(_swap_word, body)
+        if quote_wrapped:
+            flipped = '"' + flipped + '"'
+        return prefix + flipped
+
+    def flip_search_lr(self):
+        """検索欄の左右表記（L ⇔ R / Left ⇔ Right）をワンクリックで反転して再検索する。"""
+        raw_text = self.search_line.text().strip()
+        if not raw_text:
+            return
+        tokens = [t for t in raw_text.split(' ') if t]
+        flipped_tokens = [self._flip_lr_in_token(t) for t in tokens]
+        new_text = ' '.join(flipped_tokens)
+        if new_text == raw_text:
+            return
+        self.search_line.blockSignals(True)
+        self.search_line.setText(new_text)
+        self.search_line.blockSignals(False)
+        self.search_joint_list = flipped_tokens
+        self.get_set_skin_weight()
+
+    def get_influence_weight_stats(self):
+        """現在表示中の頂点データからインフルエンスごとの最大ウェイト値と影響頂点数を集計する。"""
+        stats = {}
+        if not hasattr(self, 'vtx_row_dict') or not hasattr(self, '_data'):
+            return stats
+        for row, row_data in self.vtx_row_dict.items():
+            if row >= len(self._data):
+                continue
+            influences = row_data[2]
+            weights = self._data[row]
+            for inf, w in zip(influences, weights):
+                if w > 0.00001:
+                    entry = stats.get(inf)
+                    if entry is None:
+                        stats[inf] = {'max': float(w), 'count': 1}
+                    else:
+                        if w > entry['max']:
+                            entry['max'] = float(w)
+                        entry['count'] += 1
+        return stats
+
+    def _collect_bound_influences(self):
+        """現在対象となっているメッシュの全バインド済みインフルエンス一覧を返す。"""
         if hasattr(self.store_skin_weight, 'all_influences') and self.store_skin_weight.all_influences:
-            influences = copy.copy(self.store_skin_weight.all_influences)
-        elif self.all_influences:
-            influences = copy.copy(self.all_influences)
-        
+            return copy.copy(self.store_skin_weight.all_influences)
+        if self.all_influences:
+            return copy.copy(self.all_influences)
+        return []
+
+    def open_joint_search_dialog(self):
+        """非モーダルの Joints 検索ダイアログを開く（開いている場合は前面化して最新化）。"""
+        debug_log('open_joint_search_dialog start')
+        influences = self._collect_bound_influences()
         if not influences:
             self.get_set_skin_weight()
-            if hasattr(self.store_skin_weight, 'all_influences') and self.store_skin_weight.all_influences:
-                influences = copy.copy(self.store_skin_weight.all_influences)
-            elif self.all_influences:
-                influences = copy.copy(self.all_influences)
-        
+            influences = self._collect_bound_influences()
         if not influences:
             debug_log('open_joint_search_dialog no influences')
             self.set_message(msg='- No bound joints found -', error=True)
             return
-        
+
         current_names = [name for name in self.search_line.text().split(' ') if name != '']
         nearby_names = self.get_selected_joint_short_names()
+        weight_stats = self.get_influence_weight_stats()
+
+        win = getattr(self, 'joint_search_dialog', None)
+        if win is not None:
+            try:
+                if win.isVisible():
+                    win.update_data(
+                        influences,
+                        selected_names=current_names,
+                        nearby_names=nearby_names,
+                        weight_stats=weight_stats,
+                        preserve_selection=False,
+                    )
+                    win.raise_()
+                    win.activateWindow()
+                    return
+            except Exception:
+                self.joint_search_dialog = None
+
         debug_log('open_joint_search_dialog show influences={0} nearby={1}'.format(len(influences), len(nearby_names)))
-        dialog = JointSearchDialog(influences, selected_names=current_names, nearby_names=nearby_names, parent=self)
-        dialog_exec = getattr(dialog, 'exec_', None)
-        if dialog_exec is None:
-            dialog_exec = getattr(dialog, 'exec')
-        result = dialog_exec()
-        debug_log('open_joint_search_dialog closed result={0}'.format(result))
-        if result == QDialog.Accepted:
-            self.append_joint_names_to_search(dialog.get_selected_names())
+        self.joint_search_dialog = JointSearchDialog(
+            influences,
+            selected_names=current_names,
+            nearby_names=nearby_names,
+            weight_stats=weight_stats,
+            parent=self,
+        )
+        self.joint_search_dialog.show()
+        self.joint_search_dialog.raise_()
+        self.joint_search_dialog.activateWindow()
+
+    def update_joint_search_dialog(self, force=False):
+        """Joints 検索ダイアログが開いている場合に一覧とウェイト統計をリアルタイム更新する。"""
+        win = getattr(self, 'joint_search_dialog', None)
+        if win is None:
+            return
+        try:
+            if not force and not win.isVisible():
+                return
+            influences = self._collect_bound_influences()
+            nearby_names = self.get_selected_joint_short_names()
+            weight_stats = self.get_influence_weight_stats()
+            win.update_data(
+                influences,
+                nearby_names=nearby_names,
+                weight_stats=weight_stats,
+                preserve_selection=True,
+            )
+        except Exception:
+            self.joint_search_dialog = None
+
+    def open_bone_picker_window(self):
+        """Anim Picker 風のボーンピッカー別ウィンドウを開く（開いていれば前面化して最新化）。"""
+        influences = self._collect_bound_influences()
+        if not influences:
+            self.get_set_skin_weight()
+            influences = self._collect_bound_influences()
+        if not influences:
+            self.set_message(msg='- No bound joints found -', error=True)
+            return
+
+        win = getattr(self, 'bone_picker_window', None)
+        if win is not None:
+            try:
+                if win.isVisible():
+                    win.refresh_from_editor(refresh_positions=True)
+                    win.raise_()
+                    win.activateWindow()
+                    return
+            except Exception:
+                self.bone_picker_window = None
+
+        self.bone_picker_window = bone_picker_window.BonePickerWindow(self, parent=qt.get_maya_window())
+        self.bone_picker_window.refresh_from_editor(refresh_positions=True)
+        self.bone_picker_window.show()
+        self.bone_picker_window.raise_()
+        self.bone_picker_window.activateWindow()
+
+    def update_bone_picker_window(self):
+        """ボーンピッカーが開いている場合に最新ウェイト統計・一覧へリアルタイム同期する。"""
+        win = getattr(self, 'bone_picker_window', None)
+        if win is None:
+            return
+        try:
+            if win.isVisible():
+                win.refresh_from_editor(refresh_positions=False)
+        except Exception:
+            self.bone_picker_window = None
         
     def get_selected_joint_short_names(self):
         if not hasattr(self, 'selected_items') or not self.selected_items:
@@ -169,6 +399,15 @@ class EditorViewControllerMixin(object):
         
         debug_log('get_selected_joint_short_names result={0}'.format(len(joint_names)))
         return sorted(joint_names, key=lambda name: name.upper())
+
+    def set_joint_names_to_search(self, joint_tokens):
+        """検索欄を指定ボーン一覧で上書きして即座にテーブルへ反映する。"""
+        tokens = [t for t in (joint_tokens or []) if t]
+        self.search_line.blockSignals(True)
+        self.search_line.setText(' '.join(tokens))
+        self.search_line.blockSignals(False)
+        self.search_joint_list = tokens
+        self.get_set_skin_weight()
         
     def append_joint_names_to_search(self, joint_names):
         debug_log('append_joint_names_to_search count={0}'.format(len(joint_names)))
@@ -181,10 +420,14 @@ class EditorViewControllerMixin(object):
         self.search_line.blockSignals(True)
         self.search_line.setText(' '.join(current_names))
         self.search_line.blockSignals(False)
-        self.search_joint(as_interractive=False)
+        self.search_joint_list = current_names
+        self.get_set_skin_weight()
         
     def clear_search(self):
+        self.search_line.blockSignals(True)
         self.search_line.setText('')
+        self.search_line.blockSignals(False)
+        self.search_joint_list = []
         self.get_set_skin_weight()
 
     def check_unlock(self):
@@ -229,7 +472,7 @@ class EditorViewControllerMixin(object):
                     self.hl_nodes = self.pre_hl_nodes
         '''
         try:
-            if cmds.selectMode(q=True, co=True) and not self.focus_but.isChecked():
+            if not undo and cmds.selectMode(q=True, co=True) and not self.focus_but.isChecked():
                 debug_log('get_set_skin_weight return component mode focus off')
                 return
         except Exception as e:
@@ -363,7 +606,7 @@ class EditorViewControllerMixin(object):
             if show_all:#全照会するときはノード全体のIDリストを取りに行く
                 current_vtx = self.node_vtx_dict[node]
             elif undo:
-                current_vtx = self.pre_current_vtx_dict[node]
+                current_vtx = self.pre_current_vtx_dict.get(node, [])
             else:#通常取得
                 #選択ノード数が多いとここがめっちゃ重い※重さ解消済み
                 current_vtx = self.store_skin_weight.om_selected_mesh_vertex(node, show_bad=show_bad)#表示用頂点
@@ -456,16 +699,19 @@ class EditorViewControllerMixin(object):
                 if inf in self.all_influences:
                     if inf in kept_inf_set:
                         continue
-                    # フィルター対象でもサーチに含まれている場合はスキップする
+                    # フィルター対象でも Add 検索条件に一致する場合は表示を残す
                     if self.search_joint_list and self.search_but_group.checkedId() == 1:
-                        if any([True if s.upper() in inf.split('|')[-1].upper() else False for s in self.search_joint_list]):
+                        if self._match_influence_search(inf, self.search_joint_list, require_positive=True):
                             continue
                     if value == 0.0:
                         self.all_influences.remove(inf)
                         
-        #サーチ文字リストがあればフィルターする
+        # サーチ文字リストがあれば拡張クエリでフィルタする（Refine モード）
         if self.search_joint_list and self.search_but_group.checkedId() == 0:
-            self.all_influences = [inf for inf in self.all_influences if any([True if s.upper() in inf.split('|')[-1].upper() else False for s in self.search_joint_list])]
+            self.all_influences = [
+                inf for inf in self.all_influences
+                if self._match_influence_search(inf, self.search_joint_list, require_positive=False)
+            ]
         
         self.node_influence_id_list_dict = {}#カラム抜けを回避するためのノードごとのリスト辞書
         for node in self.hl_nodes:          
@@ -569,6 +815,8 @@ class EditorViewControllerMixin(object):
                 self.update_used_joint_visibility()
             self.update_bone_visualizer(clear=clear)
             self.update_bone_remap_window()
+        self.update_joint_search_dialog()
+        self.update_bone_picker_window()
         
         
     #セルの選択変更があった場合に現在の選択セルを格納する
@@ -635,79 +883,71 @@ class EditorViewControllerMixin(object):
 
         self.update_bone_visualizer()
         self.update_bone_remap_window()
+        self.update_joint_search_dialog()
+        self.update_bone_picker_window()
         debug_log('cell_changed end')
         
     @timer
     def hilite_vertices(self):
-        cmds.undoInfo(swf=False)#不要なヒストリを残さないようにオフる
-        
-        self.counter.reset()
-        
-        vertices = []
-        row_count =  self.weight_model.rowCount()
-        selected_item = self.sel_model.currentIndex()
-        if not selected_item:
-            return
-        '''
-        if MAYA_VER <= 2016:#2016以前はIntersectsで正しくとれる
-            rows = [id for id in range(row_count) if self.sel_model.rowIntersectsSelection(id, selected_item)]
-        else:#PySide2ではなぜかrowIntersectsSelectionが正しく機能しない問題
-            rows = list(set([item.row() for item in self.sel_model.selectedIndexes()]))
-        '''
-        rows = sorted(set([item.row() for item in self.selected_items if item.row() in self.vtx_row_dict]))
-        if rows:
-            # 高速選択するために頂点番号の連続範囲を vtx[a:b] 形式へ圧縮する
-            pre_vid = None
-            pre_node = None
-            vtx_connection = []
-            for r in rows:
-                node = self.vtx_row_dict[r][6]
-                vid = self.vtx_row_dict[r][0]
-                if pre_node is None:
+        with qt.suspend_undo():
+            self.counter.reset()
+
+            vertices = []
+            selected_item = self.sel_model.currentIndex()
+            if not selected_item:
+                return
+
+            rows = sorted(set([item.row() for item in self.selected_items if item.row() in self.vtx_row_dict]))
+            if rows:
+                # 高速選択するために頂点番号の連続範囲を vtx[a:b] 形式へ圧縮する
+                pre_vid = None
+                pre_node = None
+                vtx_connection = []
+                for r in rows:
+                    node = self.vtx_row_dict[r][6]
+                    vid = self.vtx_row_dict[r][0]
+                    if pre_node is None:
+                        pre_node = node
+                        pre_vid = vid
+                        vtx_connection = [vid]
+                        continue
+                    if pre_node == node and pre_vid == vid - 1:
+                        pre_vid = vid
+                        vtx_connection.append(vid)
+                        continue
+                    vertices.append('{0}.vtx[{1}:{2}]'.format(pre_node, vtx_connection[0], vtx_connection[-1]))
                     pre_node = node
                     pre_vid = vid
                     vtx_connection = [vid]
-                    continue
-                if pre_node == node and pre_vid == vid - 1:
-                    pre_vid = vid
-                    vtx_connection.append(vid)
-                    continue
-                vertices.append('{0}.vtx[{1}:{2}]'.format(pre_node, vtx_connection[0], vtx_connection[-1]))
-                pre_node = node
-                pre_vid = vid
-                vtx_connection = [vid]
-            if pre_node is not None and vtx_connection:
-                vertices.append('{0}.vtx[{1}:{2}]'.format(pre_node, vtx_connection[0], vtx_connection[-1]))
+                if pre_node is not None and vtx_connection:
+                    vertices.append('{0}.vtx[{1}:{2}]'.format(pre_node, vtx_connection[0], vtx_connection[-1]))
 
-        self.hilite_flag = True
-        self.counter.count(string='get cell vtx :')
-        
-        orig_sel = self.original_selection or []
-        if not vertices:
-            if orig_sel:
-                cmds.select(orig_sel, r=True)
-        else:
-            if cmds.selectMode(q=True, o=True):
-                cmds.select(vertices + orig_sel, r=True)
+            self.hilite_flag = True
+            self.counter.count(string='get cell vtx :')
+
+            orig_sel = self.original_selection or []
+            if not vertices:
+                if orig_sel:
+                    cmds.select(orig_sel, r=True)
             else:
-                cmds.select(vertices, r=True)
-            
-        self.counter.count(string='select vtx :')
-        self.counter.lap_print(print_flag=state.COUNTER_PRINT)
-        
-        cmds.undoInfo(swf=True)
-        
+                if cmds.selectMode(q=True, o=True):
+                    cmds.select(vertices + orig_sel, r=True)
+                else:
+                    cmds.select(vertices, r=True)
+
+            self.counter.count(string='select vtx :')
+            self.counter.lap_print(print_flag=state.COUNTER_PRINT)
+
     # ハイライトボタン押された時に選択反映するスロット
     def reset_hilite(self, force_reset=False):
-        cmds.undoInfo(swf=False)
-        if not self.highlite_but.isChecked() or force_reset:
-            self.hilite_flag = True
-            cmds.select(cl=True)
-            if self.original_selection:
-                cmds.select(self.original_selection, r=True)
-        else:
-            self.cell_changed(self.selected_items, None)
-        cmds.undoInfo(swf=True)
+        with qt.suspend_undo():
+            if not self.highlite_but.isChecked() or force_reset:
+                self.hilite_flag = True
+                cmds.select(cl=True)
+                if self.original_selection:
+                    cmds.select(self.original_selection, r=True)
+            else:
+                self.cell_changed(self.selected_items, None)
             
     def hilite_joints(self):
         """Joint Hilite を最新状態へ更新する。"""
@@ -1089,8 +1329,7 @@ class EditorViewControllerMixin(object):
         influence = self.all_influences[column]
         if not cmds.objExists(influence):
             return
-        cmds.undoInfo(swf=False)  # 不要なヒストリを残さないようにオフる
-        try:
+        with qt.suspend_undo():
             self.pre_tool = cmds.currentCtx()  # ツールを復旧するために取得
             self.header_selection = list(self.original_selection) if self.original_selection else []
             self.pre_comp_mode = cmds.selectMode(q=True, co=True)
@@ -1098,16 +1337,15 @@ class EditorViewControllerMixin(object):
             cmds.select(influence)
             if self.target_tool_list[self.joint_tool]:
                 cmds.setToolTo(self.target_tool_list[self.joint_tool])
-        finally:
-            cmds.undoInfo(swf=True)  # ヒストリを再度有効化
-        
-    #Adjustボタン押したとき、頂点選択しにいく
+
+    # Adjustボタン押したとき、頂点選択しにいく
     def select_vertex_from_cells(self):
-        rows = list(set([item.row() for item in self.selected_items]))
+        rows = list(set([item.row() for item in self.selected_items if item.row() in self.vtx_row_dict]))
         vertices = [self.vtx_row_dict[r][5] for r in rows]
         if vertices:
-            cmds.selectMode(co=True)
-            cmds.select(vertices, r=True)
+            with qt.undo_chunk('SIWE_SelectVertexFromCells'):
+                cmds.selectMode(co=True)
+                cmds.select(vertices, r=True)
             
     #選択されているセルの行のみの表示に絞る
     def show_selected_cells(self):
@@ -1166,3 +1404,5 @@ class EditorViewControllerMixin(object):
             self.update_used_joint_visibility()
         self.update_bone_visualizer()
         self.update_bone_remap_window()
+        self.update_joint_search_dialog()
+        self.update_bone_picker_window()
