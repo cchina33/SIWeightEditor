@@ -341,13 +341,14 @@ class BoneVisualizerDrawOverride(omr.MPxDrawOverride):
             if joint_dag is None:
                 continue
             weight = float(inf["weight"])
-            display_val = value_format.format(weight * max_weight)
+            is_zero = bool(inf.get("is_zero", False)) or (weight <= 1e-6)
+            display_val = value_format.format(0.0 if is_zero else weight * max_weight)
             label_text = "{0}: {1}{2}{3}".format(inf["label"], display_val, suffix, mode_tag)
             selected = bool(inf.get("selected", False))
-            joint_items.append((joint_dag, weight, label_text, selected))
+            joint_items.append((joint_dag, weight, label_text, selected, is_zero))
 
         # ウェイトが小さい順に並べて描画し、重要度の高いボーンを最前面にする
-        joint_items.sort(key=lambda item: (item[3], item[1]))
+        joint_items.sort(key=lambda item: (item[3], not item[4], item[1]))
         self._cached_joints = joint_items
         return True
 
@@ -364,7 +365,7 @@ class BoneVisualizerDrawOverride(omr.MPxDrawOverride):
                 self._cached_meshes, self._cached_collect_individual
             )
             if origin is not None:
-                for joint_dag, weight, label_text, selected in self._cached_joints:
+                for joint_dag, weight, label_text, selected, is_zero in self._cached_joints:
                     if not joint_dag.isValid():
                         continue
                     try:
@@ -376,6 +377,7 @@ class BoneVisualizerDrawOverride(omr.MPxDrawOverride):
                         "weight": weight,
                         "label": label_text,
                         "selected": selected,
+                        "is_zero": is_zero,
                     })
 
         remap_target = None
@@ -478,10 +480,12 @@ class BoneVisualizerDrawOverride(omr.MPxDrawOverride):
         try:
             if has_bone_vis:
                 origin = data.origin
-                # 頂点起点から各ボーンへの接続ラインを描画
+                # 頂点起点から各ボーンへの接続ラインを描画（ウェイト 0 のボーンには接続ラインを描画しない）
                 if data.show_lines:
                     for entry in data.entries:
                         weight = entry["weight"]
+                        if entry.get("is_zero", False) or weight <= 1e-6:
+                            continue
                         joint_pos = entry["position"]
                         is_selected = entry["selected"]
                         color = _weight_to_heatmap_color(weight)
@@ -520,14 +524,15 @@ class BoneVisualizerDrawOverride(omr.MPxDrawOverride):
                 drawManager.setPointSize(7.0)
                 drawManager.point(origin)
 
-                # ボーン位置のマーカーとテキストラベルを描画
+                # ボーン位置のマーカーとテキストラベルを描画（ウェイト 0 もボーン名・ウェイト値を視覚化）
                 for entry in data.entries:
                     weight = entry["weight"]
+                    is_zero = entry.get("is_zero", False) or (weight <= 1e-6)
                     joint_pos = entry["position"]
                     is_selected = entry["selected"]
-                    color = _weight_to_heatmap_color(weight)
+                    color = om2.MColor((0.58, 0.72, 0.85, 0.92)) if is_zero else _weight_to_heatmap_color(weight)
 
-                    point_size = 8.0 + weight * 8.0
+                    point_size = 8.0 if is_zero else (8.0 + weight * 8.0)
                     outline_color = om2.MColor((1.0, 1.0, 1.0, 1.0)) if is_selected else om2.MColor((0.05, 0.05, 0.05, 0.95))
                     drawManager.setColor(outline_color)
                     drawManager.setPointSize(point_size + 4.0)
@@ -539,8 +544,12 @@ class BoneVisualizerDrawOverride(omr.MPxDrawOverride):
 
                     if data.show_labels:
                         drawManager.setFontSize(12)
-                        text_color = om2.MColor((1.0, 1.0, 0.55, 1.0)) if is_selected else om2.MColor((0.98, 0.98, 0.98, 1.0))
-                        bg_color = om2.MColor((0.18, 0.14, 0.04, 0.85)) if is_selected else om2.MColor((0.06, 0.06, 0.08, 0.78))
+                        if is_zero:
+                            text_color = om2.MColor((0.88, 0.95, 1.0, 1.0))
+                            bg_color = om2.MColor((0.10, 0.14, 0.20, 0.85))
+                        else:
+                            text_color = om2.MColor((1.0, 1.0, 0.55, 1.0)) if is_selected else om2.MColor((0.98, 0.98, 0.98, 1.0))
+                            bg_color = om2.MColor((0.18, 0.14, 0.04, 0.85)) if is_selected else om2.MColor((0.06, 0.06, 0.08, 0.78))
                         drawManager.setColor(text_color)
                         try:
                             drawManager.text(

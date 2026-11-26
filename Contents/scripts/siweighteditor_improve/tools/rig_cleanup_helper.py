@@ -175,19 +175,22 @@ def find_meshes_sharing_skeleton(seed_nodes):
     if not seed_joints:
         return []
 
-    # 各シードジョイントのルートジョイントを辿り、スケルトン配下すべてのジョイントを集める
+    # 各シードジョイントから上位階層を辿り（途中にグループがあっても通過）、最上位のルートジョイントを集める
     roots = []
     seen_roots = set()
     for jnt in seed_joints:
         cur = jnt
+        top_joint = jnt
         while True:
-            parents = cmds.listRelatives(cur, parent=True, type="joint", fullPath=True) or []
+            parents = cmds.listRelatives(cur, parent=True, fullPath=True) or []
             if not parents:
                 break
             cur = parents[0]
-        if cur not in seen_roots:
-            seen_roots.add(cur)
-            roots.append(cur)
+            if cmds.nodeType(cur) == "joint":
+                top_joint = cur
+        if top_joint not in seen_roots:
+            seen_roots.add(top_joint)
+            roots.append(top_joint)
 
     all_joints = list(roots)
     seen_all = set(roots)
@@ -2991,14 +2994,40 @@ def bind_unweighted_meshes_to_joints(
             was_unbound = not bool(sc)
 
             if was_unbound:
-                sc_list = cmds.skinCluster(
-                    joints,
-                    mesh_long,
-                    toSelectedBones=True,
-                    bindMethod=0,
-                    normalizeWeights=1,
-                )
-                sc = sc_list[0]
+                # 親子メッシュ同士が単一スキンクラスタへ巻き込まれないよう直下の子ノードを一時退避する
+                from .. import common as _common
+                # 未使用の中間メッシュシェイプがあれば事前に整理する
+                for sh in (cmds.listRelatives(mesh_long, shapes=True, fullPath=True, type="mesh") or []):
+                    try:
+                        if cmds.getAttr(sh + ".intermediateObject"):
+                            if not (cmds.listConnections(sh, source=True, destination=True) or []):
+                                cmds.delete(sh)
+                    except Exception:
+                        pass
+                dummy = _common.TemporaryReparent().main(mode="create")
+                try:
+                    _common.TemporaryReparent().main(mesh_long, dummyParent=dummy, mode="cut")
+                    sc_list = cmds.skinCluster(
+                        joints,
+                        mesh_long,
+                        toSelectedBones=True,
+                        bindMethod=0,
+                        normalizeWeights=1,
+                    )
+                    sc = sc_list[0] if sc_list else None
+                finally:
+                    try:
+                        _common.TemporaryReparent().main(mesh_long, dummyParent=dummy, mode="parent")
+                    except Exception:
+                        pass
+                    try:
+                        _common.TemporaryReparent().main(dummyParent=dummy, mode="delete")
+                    except Exception:
+                        pass
+                verified_sc = _get_skin_cluster_for_mesh_bind(mesh_long)
+                if not verified_sc:
+                    raise RuntimeError("スキンクラスタの作成確認に失敗しました: {0}".format(mesh_long))
+                sc = verified_sc
                 newly_bound.append(mesh_long)
             else:
                 existing_infs = cmds.ls(cmds.skinCluster(sc, q=True, inf=True) or [], long=True) or []

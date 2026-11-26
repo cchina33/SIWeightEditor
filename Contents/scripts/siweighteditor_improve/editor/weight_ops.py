@@ -935,42 +935,125 @@ class EditorWeightOpsMixin(object):
                     except Exception as e:
                         print('clear lock error :', skin_cluster, '{}'.format(e))
             
-    #コピペ右クリックメニュー
-    def pop_copy_menu(self):
-        copy_menus = QMenu()
-        action = copy_menus.addAction('Copy_Vertex_Weights')
+    def copy_bone_names_to_clipboard(self, joint_paths, full_path=False):
+        """指定されたボーン名（またはフルパス）をクリップボードへコピーして通知する。"""
+        names = []
+        seen = set()
+        for jp in (joint_paths or []):
+            if not jp:
+                continue
+            val = str(jp) if full_path else str(jp).split('|')[-1]
+            if val and val not in seen:
+                seen.add(val)
+                names.append(val)
+        if not names:
+            return
+        text = '\n'.join(names)
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
+        disp = names[0] if len(names) == 1 else '{0} (+{1})'.format(names[0], len(names) - 1)
+        msg = lang.Lang(
+            en='- Copied Bone Name : {0} -',
+            ja=u'- ボーン名をコピーしました : {0} -',
+        ).output().format(disp)
+        if hasattr(self, 'set_message'):
+            self.set_message(msg=msg, error=False)
+
+    # コピペ・ボーン名コピー右クリックメニュー（Shift / Ctrl + 右クリック）
+    def pop_copy_menu(self, column=None):
+        copy_menus = QMenu(self)
+        action = copy_menus.addAction(
+            lang.Lang(en='Copy Vertex Weights', ja=u'頂点ウェイトをコピー').output()
+        )
         action.triggered.connect(self.vertex_copy)
-        action = copy_menus.addAction('Paste_Vertex_Weights')
+        action = copy_menus.addAction(
+            lang.Lang(en='Paste Vertex Weights', ja=u'頂点ウェイトをペースト').output()
+        )
         action.triggered.connect(self.vertex_paste)
-        copy_menus.addSeparator()#分割線追加
-        action = copy_menus.addAction('Copy_Cell_Values')
+        copy_menus.addSeparator()
+        action = copy_menus.addAction(
+            lang.Lang(en='Copy Cell Values', ja=u'セルの数値をコピー').output()
+        )
         action.triggered.connect(self.cell_copy)
-        action = copy_menus.addAction('Paste_Cell_Values')
+        action = copy_menus.addAction(
+            lang.Lang(en='Paste Cell Values', ja=u'セルの数値をペースト').output()
+        )
         action.triggered.connect(self.cell_paste)
+
+        all_infs = getattr(self, 'all_influences', None) or []
+        clicked_inf = None
+        if column is not None and 0 <= column < len(all_infs):
+            clicked_inf = all_infs[column]
+
+        sel_infs = []
+        seen_cols = set()
+        for item in (getattr(self, 'selected_items', None) or []):
+            col = item.column()
+            if col not in seen_cols and 0 <= col < len(all_infs):
+                seen_cols.add(col)
+                sel_infs.append(all_infs[col])
+
+        if clicked_inf or sel_infs:
+            copy_menus.addSeparator()
+            primary_inf = clicked_inf or sel_infs[0]
+            primary_short = primary_inf.split('|')[-1]
+            copy_one_act = copy_menus.addAction(
+                lang.Lang(
+                    en='Copy Bone Name ({0})',
+                    ja=u'ボーン名をコピー ({0})',
+                ).output().format(primary_short)
+            )
+            copy_one_act.triggered.connect(
+                lambda _=False, jp=primary_inf: self.copy_bone_names_to_clipboard([jp], full_path=False)
+            )
+
+            if len(sel_infs) > 1:
+                copy_all_act = copy_menus.addAction(
+                    lang.Lang(
+                        en='Copy All Selected Bone Names ({0})',
+                        ja=u'選択中のボーン名をすべてコピー ({0}本)',
+                    ).output().format(len(sel_infs))
+                )
+                copy_all_act.triggered.connect(
+                    lambda _=False, jps=list(sel_infs): self.copy_bone_names_to_clipboard(jps, full_path=False)
+                )
+
+            path_targets = sel_infs if len(sel_infs) > 1 else [primary_inf]
+            copy_path_act = copy_menus.addAction(
+                lang.Lang(
+                    en='Copy Bone Full Path',
+                    ja=u'ボーンのフルパスをコピー',
+                ).output()
+            )
+            copy_path_act.triggered.connect(
+                lambda _=False, jps=list(path_targets): self.copy_bone_names_to_clipboard(jps, full_path=True)
+            )
+
         cursor = QCursor.pos()
         exec_func = getattr(copy_menus, 'exec_', None) or getattr(copy_menus, 'exec')
         exec_func(cursor)
             
-    #右クリックしたときの小窓を反映する。
+    # 右クリックしたときの小窓を反映する。
     def get_clicke_item_value(self):
         shift_mod = qt.check_key_modifiers(Qt.ShiftModifier)
         ctrl_mod = qt.check_key_modifiers(Qt.ControlModifier)
-        #ヘッダーの幅を取得してカラム位置をオフセットする
+        # ヘッダーの幅を取得してカラム位置をオフセットする
         v_header = self.view_widget.verticalHeader()
         v_header_width = v_header.sizeHint().width()
         h_header = self.view_widget.horizontalHeader()
         h_header_height = h_header.sizeHint().height()
         
         pos = self.view_widget.mapFromGlobal(QCursor.pos())
-        pos_x = pos.x() - v_header_width - 2#誤差補正
-        pos_y = pos.y() - h_header_height -2 #誤差補正
+        pos_x = pos.x() - v_header_width - 2  # 誤差補正
+        pos_y = pos.y() - h_header_height - 2  # 誤差補正
         row = self.view_widget.rowAt(pos_y)
         column = self.view_widget.columnAt(pos_x)
         if column == -1:
             column = len(self.all_influences)
         text = self.weight_model.get_data(row=row, column=column)
         if text is None or shift_mod or ctrl_mod:
-            self.pop_copy_menu()
+            self.pop_copy_menu(column=column)
             return
         else:
             text = text*state.MAXIMUM_WEIGHT

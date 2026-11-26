@@ -2,6 +2,7 @@
 """スキニング済みメッシュ＆ボーンの修正（記録→解除→修正→再バインド＆補間復元）、ジョイント整理・Joint Orient、メッシュ＆シーンクリーンアップ専用ウィンドウ。"""
 
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -164,10 +165,22 @@ def _find_hips_joint_in_skeleton(seed_joints):
 
 
 def _make_safe_filename(mesh_name):
-    """メッシュ名からファイルシステム上安全な JSON ファイル名を生成する。"""
-    short_name = mesh_name.split("|")[-1]
-    safe = re.sub(r'[\\/:*?"<>|]+', "_", short_name).strip("_")
-    return (safe or "mesh") + ".json"
+    """メッシュフルパスから重複衝突しない安全な JSON ファイル名を生成する。"""
+    full_path = str(mesh_name or "")
+    short_name = full_path.split("|")[-1]
+    safe = re.sub(r'[\\/:*?"<>|]+', "_", short_name).strip("_") or "mesh"
+    # 別グループ配下の同名メッシュ同士が上書き衝突しないようフルパス由来の短縮ハッシュを付与する
+    if "|" in full_path:
+        path_hash = hashlib.md5(full_path.encode("utf-8")).hexdigest()[:8]
+        return "{0}__{1}.json".format(safe, path_hash)
+    return safe + ".json"
+
+
+def _make_legacy_safe_filename(mesh_name):
+    """旧形式（短縮名のみ）の JSON ファイル名を返す。"""
+    short_name = str(mesh_name or "").split("|")[-1]
+    safe = re.sub(r'[\\/:*?"<>|]+', "_", short_name).strip("_") or "mesh"
+    return safe + ".json"
 
 
 def _get_visible_mesh_dag(node_path):
@@ -397,28 +410,89 @@ def export_mesh_skin_json(mesh_long, saved_frame=None, edit_frame=None):
         "weights": sparse_weights,
     }
 
-    save_path = os.path.join(_get_storage_dir(), _make_safe_filename(mesh_long))
+    storage_dir = _get_storage_dir()
+    save_path = os.path.join(storage_dir, _make_safe_filename(mesh_long))
     with open(save_path, "w") as fp:
         json.dump(payload, fp)
+
+    # 同一フルパスを指す旧形式 JSON（ハッシュなし）が残っていれば重複復元防止のため整理する
+    legacy_path = os.path.join(storage_dir, _make_legacy_safe_filename(mesh_long))
+    if os.path.normcase(legacy_path) != os.path.normcase(save_path) and os.path.exists(legacy_path):
+        try:
+            with open(legacy_path, "r") as lfp:
+                legacy_data = json.load(lfp)
+            if legacy_data.get("mesh_long") == mesh_long:
+                os.remove(legacy_path)
+        except Exception:
+            pass
     return save_path, payload
 
 
 def _resolve_existing_influences(saved_influences):
-    """JSON 内のボーン名リストを現在シーンの存在するフルパス一覧へ解決する。"""
+    """JSON 内のボーン名リストを現在シーンの存在するフルパス一覧へ重複なく解決する。"""
     resolved = []
+    seen = set()
     missing = []
     for saved_inf in saved_influences:
+        cand = None
         if cmds.objExists(saved_inf):
-            found = cmds.ls(saved_inf, long=True) or [saved_inf]
-            resolved.append(found[0])
-            continue
-        short_name = saved_inf.split("|")[-1]
-        found = cmds.ls(short_name, type="joint", long=True) or []
-        if found:
-            resolved.append(found[0])
+            found = cmds.ls(saved_inf, type="joint", long=True) or cmds.ls(saved_inf, long=True) or [saved_inf]
+            cand = found[0]
+        else:
+            short_name = saved_inf.split("|")[-1]
+            found = cmds.ls(short_name, type="joint", long=True) or []
+            if found:
+                cand = found[0]
+        if cand:
+            if cand not in seen:
+                seen.add(cand)
+                resolved.append(cand)
         else:
             missing.append(saved_inf)
     return resolved, missing
+
+
+def _resolve_target_mesh_for_record(rec):
+    """JSON 記録から現在シーンの復元先ポリゴンメッシュ（フルパス）を正確に解決する。"""
+    mesh_long = rec.get("mesh_long") or ""
+    mesh_short = rec.get("mesh_short") or mesh_long.split("|")[-1]
+
+    # フルパスが一致し、かつ可視ポリゴンシェイプを持つトランスフォームを最優先する
+    if mesh_long and cmds.objExists(mesh_long):
+        if _get_visible_mesh_dag(mesh_long) is not None:
+            return mesh_long
+
+    if not mesh_short:
+        return None
+
+    # 短縮名フォールバックではグループやジョイントを除外し、ポリゴンメッシュのみを候補にする
+    raw_candidates = cmds.ls(mesh_short, type="transform", long=True) or []
+    mesh_candidates = []
+    seen = set()
+    for cand in raw_candidates:
+        if cand in seen:
+            continue
+        shape_dag = _get_visible_mesh_dag(cand)
+        if shape_dag is None:
+            continue
+        seen.add(cand)
+        is_vis = rig_cleanup_helper._is_dag_visible(cand, shape_dag=shape_dag)
+        # 元のフルパスとの親階層一致数をスコア化して最も近いメッシュを選ぶ
+        orig_parts = [p for p in mesh_long.split("|") if p]
+        cand_parts = [p for p in cand.split("|") if p]
+        common_suffix = 0
+        for op, cp in zip(reversed(orig_parts), reversed(cand_parts)):
+            if op == cp:
+                common_suffix += 1
+            else:
+                break
+        mesh_candidates.append((1 if is_vis else 0, common_suffix, cand))
+
+    if not mesh_candidates:
+        return None
+
+    mesh_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return mesh_candidates[0][2]
 
 
 def _detach_and_freeze_for_modeling(mesh_long):
@@ -558,25 +632,59 @@ def finish_modeling_and_restore(
 
     skin_params = payload.get("skin_params") or {}
     maintain_max = bool(skin_params.get("maintainMaxInfluences", False))
-    max_infs = int(skin_params.get("maxInfluences", 4))
-    dropoff_rate = float(skin_params.get("dropoffRate", 4.0))
+    max_infs = max(1, int(skin_params.get("maxInfluences", 4)))
+    dropoff_rate = max(0.1, min(10.0, float(skin_params.get("dropoffRate", 4.0))))
     skinning_method = int(skin_params.get("skinningMethod", 0))
+    if skinning_method not in (0, 1, 2):
+        skinning_method = 0
+    bind_method = int(skin_params.get("bindMethod", 0))
+    if bind_method not in (0, 1, 2, 3):
+        bind_method = 0
     normalize_weights = int(skin_params.get("normalizeWeights", 1))
+    if normalize_weights not in (0, 1, 2):
+        normalize_weights = 1
 
     # 子ノードを一時退避して安全に再バインドする
     dummy = common.TemporaryReparent().main(mode="create")
     try:
         common.TemporaryReparent().main(mesh_long, dummyParent=dummy, mode="cut")
-        skin_clusters = cmds.skinCluster(
-            resolved_infs,
-            mesh_long,
-            toSelectedBones=True,
-            obeyMaxInfluences=maintain_max,
-            maximumInfluences=max_infs,
-            dropoffRate=dropoff_rate,
-            skinMethod=skinning_method,
-            normalizeWeights=normalize_weights,
-        )
+        try:
+            skin_clusters = cmds.skinCluster(
+                resolved_infs,
+                mesh_long,
+                toSelectedBones=True,
+                bindMethod=bind_method,
+                obeyMaxInfluences=maintain_max,
+                maximumInfluences=max_infs,
+                dropoffRate=dropoff_rate,
+                skinMethod=skinning_method,
+                normalizeWeights=normalize_weights,
+            )
+        except Exception as bind_exc:
+            # 詳細フラグとの競合時は最小安全オプションで再試行し、後から主要設定を反映する
+            print("ModelEdit skinCluster retry with safe flags:", mesh_long, bind_exc)
+            skin_clusters = cmds.skinCluster(
+                resolved_infs,
+                mesh_long,
+                toSelectedBones=True,
+                bindMethod=0,
+                normalizeWeights=1,
+            )
+            if skin_clusters:
+                sc_retry = skin_clusters[0]
+                for attr_name, attr_val in (
+                    ("skinningMethod", skinning_method),
+                    ("maintainMaxInfluences", maintain_max),
+                    ("maxInfluences", max_infs),
+                    ("dropoffRate", dropoff_rate),
+                    ("normalizeWeights", normalize_weights),
+                ):
+                    try:
+                        cmds.setAttr(sc_retry + "." + attr_name, attr_val)
+                    except Exception:
+                        pass
+        if not skin_clusters or not cmds.objExists(skin_clusters[0]):
+            raise RuntimeError("Failed to create skinCluster on: {0}".format(mesh_long))
         skin_cluster = skin_clusters[0]
     finally:
         try:
@@ -680,8 +788,13 @@ def finish_modeling_and_restore(
     except Exception:
         pass
 
+    # 再バインド後にスキンクラスタが対象メッシュへ確実に接続されているか実確認する
+    verified_sc = _get_skin_cluster(mesh_long)
+    if not verified_sc or not cmds.objExists(verified_sc):
+        raise RuntimeError("SkinCluster verification failed after rebind: {0}".format(mesh_long))
+
     return {
-        "skin_cluster": skin_cluster,
+        "skin_cluster": verified_sc,
         "orig_vtx_count": orig_vtx_count,
         "new_vtx_count": new_vtx_count,
         "method": used_method,
@@ -3259,8 +3372,8 @@ class ModelEditWindow(qt.SubWindow):
         found = []
         missing = []
         for rec in recs:
-            target = rec["mesh_long"] if cmds.objExists(rec["mesh_long"]) else rec["mesh_short"]
-            if cmds.objExists(target):
+            target = _resolve_target_mesh_for_record(rec)
+            if target and cmds.objExists(target):
                 found.append(target)
             else:
                 missing.append(rec["mesh_short"])
@@ -3323,7 +3436,7 @@ class ModelEditWindow(qt.SubWindow):
                 return
             pairs.append((recs[0], meshes[0]))
         else:
-            # 修正完了ボタンでは一覧に記録されている全メッシュ（シーン内に存在するもの）を一括復元する
+            # 修正完了ボタンでは「修正中」レコードを優先して一括復元する（修正中が 0 件のときだけ全件対象）
             self.reload_record_list()
             if not self._records:
                 self._set_status(
@@ -3334,12 +3447,15 @@ class ModelEditWindow(qt.SubWindow):
                     error=True,
                 )
                 return
-            for rec in self._records:
-                if cmds.objExists(rec["mesh_long"]):
-                    pairs.append((rec, rec["mesh_long"]))
-                elif cmds.objExists(rec["mesh_short"]):
-                    found = cmds.ls(rec["mesh_short"], long=True) or [rec["mesh_short"]]
-                    pairs.append((rec, found[0]))
+            editing_records = [r for r in self._records if r["status"] == "editing"]
+            target_records = editing_records if editing_records else list(self._records)
+            seen_targets = set()
+            for rec in target_records:
+                resolved_mesh = _resolve_target_mesh_for_record(rec)
+                if resolved_mesh:
+                    if resolved_mesh not in seen_targets:
+                        seen_targets.add(resolved_mesh)
+                        pairs.append((rec, resolved_mesh))
                 else:
                     missing_meshes.append(rec["mesh_short"])
             if not pairs:
@@ -3361,6 +3477,7 @@ class ModelEditWindow(qt.SubWindow):
 
         restored_paths = []
         restored_meshes = []
+        failed_meshes = []
         summaries = []
         total_missing_bones = 0
         max_moved_joints = 0
@@ -3382,43 +3499,43 @@ class ModelEditWindow(qt.SubWindow):
             try:
                 cmds.selectMode(object=True)
                 for rec, target_mesh in pairs:
-                    with open(rec["path"], "r") as fp:
-                        payload = json.load(fp)
-                    if saved_frame_to_restore is None and payload.get("saved_frame") is not None:
-                        saved_frame_to_restore = float(payload["saved_frame"])
-                    result = finish_modeling_and_restore(
-                        target_mesh,
-                        payload,
-                        restore_mode=restore_mode,
-                        smooth_iters=smooth_iters,
-                        clean_orphaned_bind_pose=clean_bind_pose,
-                    )
-                    payload["status"] = "restored"
-                    with open(rec["path"], "w") as fp:
-                        json.dump(payload, fp)
-
-                    restored_paths.append(rec["path"])
-                    restored_meshes.append(target_mesh)
-                    total_missing_bones += len(result["missing_infs"])
-                    max_moved_joints = max(max_moved_joints, int(result.get("moved_joints", 0)))
-
-                    m_tag = u"Idx" if result["method"] == "index" else u"Surf"
-                    summaries.append(
-                        "{0} ({1}->{2} / {3})".format(
-                            target_mesh.split("|")[-1],
-                            result["orig_vtx_count"],
-                            result["new_vtx_count"],
-                            m_tag,
+                    try:
+                        with open(rec["path"], "r") as fp:
+                            payload = json.load(fp)
+                        if saved_frame_to_restore is None and payload.get("saved_frame") is not None:
+                            saved_frame_to_restore = float(payload["saved_frame"])
+                        result = finish_modeling_and_restore(
+                            target_mesh,
+                            payload,
+                            restore_mode=restore_mode,
+                            smooth_iters=smooth_iters,
+                            clean_orphaned_bind_pose=clean_bind_pose,
                         )
-                    )
+                        payload["status"] = "restored"
+                        payload["mesh_long"] = target_mesh
+                        with open(rec["path"], "w") as fp:
+                            json.dump(payload, fp)
+
+                        restored_paths.append(rec["path"])
+                        restored_meshes.append(target_mesh)
+                        total_missing_bones += len(result["missing_infs"])
+                        max_moved_joints = max(max_moved_joints, int(result.get("moved_joints", 0)))
+
+                        m_tag = u"Idx" if result["method"] == "index" else u"Surf"
+                        summaries.append(
+                            "{0} ({1}->{2} / {3})".format(
+                                target_mesh.split("|")[-1],
+                                result["orig_vtx_count"],
+                                result["new_vtx_count"],
+                                m_tag,
+                            )
+                        )
+                    except Exception as mesh_exc:
+                        # 1 メッシュ失敗しても残りの全メッシュの再バインドを必ず継続する
+                        failed_meshes.append((target_mesh.split("|")[-1], str(mesh_exc)))
+                        print("ModelEdit restore mesh error:", target_mesh, mesh_exc)
                 if restored_meshes:
                     cmds.select(restored_meshes, replace=True)
-            except Exception as exc:
-                self._set_status(
-                    lang.Lang(en="Restore error: {0}", ja=u"復元エラー: {0}").output().format(exc),
-                    error=True,
-                )
-                raise
             finally:
                 cmds.undoInfo(closeChunk=True)
 
@@ -3441,6 +3558,11 @@ class ModelEditWindow(qt.SubWindow):
             en="Restored {0} mesh(es)",
             ja=u"復元完了（{0} メッシュ）",
         ).output().format(len(summaries))
+        if failed_meshes:
+            short_msg += lang.Lang(
+                en=" | Failed: {0}",
+                ja=u" ｜ 失敗: {0} 件",
+            ).output().format(len(failed_meshes))
         if restored_frame_val is not None:
             short_msg += lang.Lang(
                 en=" | Frame: {0}",
@@ -3480,6 +3602,15 @@ class ModelEditWindow(qt.SubWindow):
         )
         for item in summaries:
             detail_lines.append("  " + item)
+        if failed_meshes:
+            detail_lines.append(
+                lang.Lang(
+                    en="Failed meshes ({0}) [kept as Editing]:",
+                    ja=u"再バインド失敗メッシュ ({0} 件・修正中のまま保持):",
+                ).output().format(len(failed_meshes))
+            )
+            for name, err_msg in failed_meshes:
+                detail_lines.append("  {0}: {1}".format(name, err_msg))
         if missing_meshes:
             detail_lines.append(
                 lang.Lang(
@@ -3491,11 +3622,12 @@ class ModelEditWindow(qt.SubWindow):
                 detail_lines.append("  " + name)
         detail_msg = "\n".join(detail_lines)
 
-        self._set_status(short_msg, error=False, detail=detail_msg)
+        has_error = bool(failed_meshes)
+        self._set_status(short_msg, error=has_error, detail=detail_msg)
         if self.editor is not None and not getattr(self.editor, "closed_flag", False):
             try:
                 self.editor.get_set_skin_weight(cycle=True)
-                self.editor.set_message(msg="- " + short_msg + " -", error=False)
+                self.editor.set_message(msg="- " + short_msg + " -", error=has_error)
             except Exception:
                 pass
 

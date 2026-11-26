@@ -1316,6 +1316,79 @@ class EditorViewControllerMixin(object):
     header_selection = None
     pre_comp_mode = None
     target_tool_list = [None, 'scaleSuperContext', 'RotateSuperContext', 'moveSuperContext']
+    def _select_influence_in_viewport(self, influence):
+        """指定インフルエンスをビューポートで選択し、設定されたマニピュレータへ切り替える。"""
+        if not influence or not cmds.objExists(influence):
+            return
+        with qt.suspend_undo():
+            self.pre_tool = cmds.currentCtx()  # ツールを復旧するために取得
+            self.header_selection = list(self.original_selection) if self.original_selection else []
+            self.pre_comp_mode = cmds.selectMode(q=True, co=True)
+            self.hilite_flag = True  # get_set しないためのフラグ
+            cmds.select(influence)
+            if self.target_tool_list[self.joint_tool]:
+                cmds.setToolTo(self.target_tool_list[self.joint_tool])
+
+    def pop_header_bone_menu(self, column):
+        """ボーン名ヘッダーの Shift / Ctrl 右クリック時にボーン名コピー・選択メニューを表示する。"""
+        all_infs = getattr(self, 'all_influences', None) or []
+        if column < 0 or column >= len(all_infs):
+            return
+        influence = all_infs[column]
+        short_name = influence.split('|')[-1]
+
+        menu = QMenu(self)
+        copy_act = menu.addAction(
+            lang.Lang(
+                en='Copy Bone Name ({0})',
+                ja=u'ボーン名をコピー ({0})',
+            ).output().format(short_name)
+        )
+        copy_act.triggered.connect(
+            lambda _=False, jp=influence: self.copy_bone_names_to_clipboard([jp], full_path=False)
+        )
+
+        # 複数列が選択中なら選択ボーン名の一括コピーも提供する
+        sel_infs = []
+        seen_cols = set()
+        for item in (getattr(self, 'selected_items', None) or []):
+            col = item.column()
+            if col not in seen_cols and 0 <= col < len(all_infs):
+                seen_cols.add(col)
+                sel_infs.append(all_infs[col])
+        if len(sel_infs) > 1:
+            copy_all_act = menu.addAction(
+                lang.Lang(
+                    en='Copy All Selected Bone Names ({0})',
+                    ja=u'選択中のボーン名をすべてコピー ({0}本)',
+                ).output().format(len(sel_infs))
+            )
+            copy_all_act.triggered.connect(
+                lambda _=False, jps=list(sel_infs): self.copy_bone_names_to_clipboard(jps, full_path=False)
+            )
+
+        copy_path_act = menu.addAction(
+            lang.Lang(
+                en='Copy Bone Full Path',
+                ja=u'ボーンのフルパスをコピー',
+            ).output()
+        )
+        copy_path_act.triggered.connect(
+            lambda _=False, jp=influence: self.copy_bone_names_to_clipboard([jp], full_path=True)
+        )
+
+        menu.addSeparator()
+        sel_act = menu.addAction(
+            lang.Lang(
+                en='Select Joint ({0})',
+                ja=u'ジョイントを選択 ({0})',
+            ).output().format(short_name)
+        )
+        sel_act.triggered.connect(lambda _=False, jp=influence: self._select_influence_in_viewport(jp))
+
+        exec_func = getattr(menu, 'exec_', None) or getattr(menu, 'exec')
+        exec_func(QCursor.pos())
+
     def select_joint_from_header(self):
         if not getattr(self, 'all_influences', None):
             return
@@ -1326,17 +1399,13 @@ class EditorViewControllerMixin(object):
         column = self.view_widget.columnAt(pos_x)
         if column < 0 or column >= len(self.all_influences):
             return
-        influence = self.all_influences[column]
-        if not cmds.objExists(influence):
+        shift_mod = qt.check_key_modifiers(Qt.ShiftModifier)
+        ctrl_mod = qt.check_key_modifiers(Qt.ControlModifier)
+        if shift_mod or ctrl_mod:
+            self.pop_header_bone_menu(column)
             return
-        with qt.suspend_undo():
-            self.pre_tool = cmds.currentCtx()  # ツールを復旧するために取得
-            self.header_selection = list(self.original_selection) if self.original_selection else []
-            self.pre_comp_mode = cmds.selectMode(q=True, co=True)
-            self.hilite_flag = True  # get_set しないためのフラグ
-            cmds.select(influence)
-            if self.target_tool_list[self.joint_tool]:
-                cmds.setToolTo(self.target_tool_list[self.joint_tool])
+        influence = self.all_influences[column]
+        self._select_influence_in_viewport(influence)
 
     # Adjustボタン押したとき、頂点選択しにいく
     def select_vertex_from_cells(self):

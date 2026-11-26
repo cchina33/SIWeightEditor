@@ -1,6 +1,14 @@
-# Maya 2025 以降 互換性チェック・修正リスト
+# Maya 2025〜2027 互換性チェック・修正リスト
 
-`README.md` に記載されている全機能を対象に、**Maya 2025 以降（Python 3.11+ / PySide6・Qt6 / Maya 2022+ デフォーマ仕様）** および **Maya 2026 以降（Python 3.12+）** での互換性・不具合を検証し、実施した修正内容をまとめた一覧です。
+`README.md` に記載されている全機能を対象に、**Maya 2025〜2027（Python 3.11〜3.13 / PySide6・Qt6 / Maya 2022+ デフォーマ仕様）** での互換性・不具合を検証し、実施した修正および機能拡張の内容をまとめた一覧です。
+
+### マルチバージョン検証環境（全 38 スクリプト構文＆警告ゼロ確認済み）
+
+| Maya バージョン | Python | PySide6 / Qt6 | 構文エラー / 警告 | 備考 |
+| :--- | :--- | :--- | :---: | :--- |
+| **Maya 2025** | `3.11.4` | `6.5.3` | **0 / 0** | 全 38 `.py` ファイル確認済み |
+| **Maya 2026** | `3.11.9` | `6.5.3` | **0 / 0** | 全 38 `.py` ファイル確認済み |
+| **Maya 2027** | `3.13.9` | `6.8.3` | **0 / 0** | 全 38 ファイル構文・31 モジュール実機 import・同梱プラグイン 2 本ロード・主要機能スモークテスト・フォーク元共存起動すべて確認済み |
 
 ---
 
@@ -136,13 +144,14 @@ Maya 2025 互換化に続き、実務運用で発生した不具合の解消お�
 
 | カテゴリ | 主な対応内容 | 対象ファイル |
 | :--- | :--- | :--- |
-| **ウィンドウ制御・起動安定化** | Maya 背面潜り込み防止（Qt + Win32 オーナー固定）、起動時の二重開閉・チラつき解消、`ApplicationPlugins` 配置互換＆二重初期化ガード | `qt.py`, `editor/state.py`, `editor/widgets.py`, `siweighteditor.py`, `userSetup.py`, `startup.py` |
+| **ウィンドウ制御・起動安定化** | Maya 背面潜り込み防止（Qt + Win32 オーナー固定）、起動時の二重開閉・チラつき解消、`ApplicationPlugins` 配置互換＆二重初期化ガード、Windows メニュー空サブメニュー防止・自動再構築 | `qt.py`, `editor/state.py`, `editor/widgets.py`, `siweighteditor.py`, `userSetup.py`, `startup.py` |
 | **Undo / スライダー刷新** | 1 ドラッグ = 1 Undo 化、`Add`/`Add%` 基準計算修正、Undo 破壊・閉鎖後エラー・履歴汚染・Undo 無効化リーク解消 | `bake_skin_weight_improve.py`, `qt.py`, `siweighteditor.py`, `editor/*`, `modeling.py`, `weight_transfer_multiple.py` |
 | **正規化警告の抑止** | `Specified weights required modification for normalization.` の警告出力を Undo 非汚染で抑止 | `bake_skin_weight_improve.py`, `tools/rig_cleanup_helper.py`, `tools/model_edit_window.py` |
-| **モデル修正タブの安全性向上** | 0 フレームの回転 XYZ 不正値混入バグ修正、記憶ジョイントの `[キャラ名]_Hips` 確認ダイアログ＆注意表示 | `tools/model_edit_window.py` |
+| **モデル修正タブの安全性向上** | 0 フレームの回転 XYZ 不正値混入バグ修正、記憶ジョイントの `[キャラ名]_Hips` 確認、同名メッシュ JSON 衝突解消・修正中優先＆エラー継続・復元先厳密解決・`skinCluster` 再バインド堅牢化＆検証 | `tools/model_edit_window.py`, `tools/rig_cleanup_helper.py` |
 | **選択ボーン回転フリーズ** | 現在回転を `jointOrient` へ焼き込んで 0F = 0 に固定、選択ボーンと全子ボーンのキー退避＆書き戻し（0F 以降は元の値をそのまま復元） | `tools/rig_cleanup_helper.py`, `tools/model_edit_window.py` |
 | **バインド / ミラー＆コピー新設** | ボーンの安全バインド、高精度ミラー＆コピー、ウェイト無しメッシュ一覧バインド専用ウィンドウ（非表示オブジェクト除外） | `tools/rig_cleanup_helper.py`, `tools/weight_mirror_copy_helper.py`, `tools/unweighted_bind_window.py`, `tools/model_edit_window.py` |
 | **ジョイント検索 / ピッカー** | 非モーダル検索ウィンドウ（リアルタイム絞り込み・範囲／左右フィルタ・統計表示・厳密一致・シーン選択同期）および人型／実スケルトン 2D ボーンピッカー連携 | `editor/widgets.py`, `editor/view_controller.py`, `tools/bone_picker_window.py` |
+| **Bone Vis 改良 ＆ メニュー／コピー** | ウェイト 0 選択ボーンのラベル・マーカー視覚化（接続ライン非表示）、Shift/Ctrl 右クリックメニュー日本語化、数値セル／ボーン名ヘッダーからのボーン名コピー | `viewport/bone_visualizer.py`, `siwe_bone_visualizer.py`, `editor/weight_ops.py`, `editor/view_controller.py` |
 | **ツールバー / Remap UI 改善** | 追加機能ボタンを `+View`（表示系）と `+Win`（ウィンドウ系）へ分離・色分け、Bone Weight Remap 上部ガイド追加 | `editor/ui_builder.py`, `tools/bone_remap_window.py` |
 
 ---
@@ -286,3 +295,48 @@ Maya 2025 互換化に続き、実務運用で発生した不具合の解消お�
 - **Bone Weight Remap の UI 上部ガイド追加**
   - 対象：`Contents/scripts/siweighteditor_improve/tools/bone_remap_window.py`
   - 内容：ウィンドウ最上部にウェイト移動・ボーン追加・「対象を固定」の使い方をまとめた日英対応の説明パネルを追加し、初期ウィンドウ高さを `520` → `585` に調整。
+
+---
+
+### 9. Bone Vis のウェイト 0 表示改良・Shift/Ctrl メニュー日本語化・ボーン名コピー
+
+- **Bone Vis（3D ビューポート透視表示）のウェイト 0 表示改良**
+  - 対象：`Contents/scripts/siweighteditor_improve/viewport/bone_visualizer.py`、`Contents/plug-ins/siwe_bone_visualizer.py`
+  - 内容：
+    - `update_from_window()` で、テーブル上で選択しているボーン列（`selected_joints`）のウェイトが `0`（`<= WEIGHT_EPSILON`）だった場合も `is_zero=True` として描画リストへ追加するよう拡張（対象頂点の影響ボーンが 0 本の場合も選択ボーンがあれば表示を維持）。
+    - `BoneVisualizerDrawOverride.addUIDrawables()` において、**ウェイト 0（`is_zero` または `weight <= 1e-6`）のボーンには接続ラインを描画しない** よう分岐を追加。
+    - ウェイト 0 ボーンのマーカーは視認しやすい青灰系（選択時は白アウトライン）、ラベルは淡い水色白（`ボーン名: 0.0%` 等）で表示し、ウェイト `> 0` の通常ボーンおよび微小ウェイト（`< 5%`・破線強調）と明確に区別可能にした。
+
+- **ウェイト数値セルの Shift / Ctrl 右クリックメニュー日本語化 ＆ ボーン名コピー**
+  - 対象：`Contents/scripts/siweighteditor_improve/editor/weight_ops.py`、`Contents/scripts/siweighteditor_improve/editor/view_controller.py`
+  - 内容：
+    - `pop_copy_menu()` の英語固定表記を `lang.Lang` による日英切替へ変更（`頂点ウェイトをコピー` / `頂点ウェイトをペースト` / `セルの数値をコピー` / `セルの数値をペースト`）。
+    - `copy_bone_names_to_clipboard()` を追加し、**ウェイト数値セルの `Shift` / `Ctrl` 右クリックメニュー** および **ボーン名ヘッダー（縦書きボーン名セル）の `Shift` / `Ctrl` 右クリックメニュー（`pop_header_bone_menu()`）** の両方から、ボーン名（ショートネーム）・選択中の複数ボーン名一括・ボーンのフルパスをクリップボードへコピーできるよう拡張（通常のヘッダー右クリックによるジョイント選択＆ツール切替はそのまま維持）。コピー時はウィンドウ下部のメッセージ欄へ通知を表示。
+
+---
+
+### 10. Windows メニュー起動不可（空サブメニュー）修正 ＆ モデル修正の再バインド漏れ防止
+
+- **Windows メニュー（`SiWeightEditor Improve`）が空サブメニューになり起動できない不具合の修正**
+  - 対象：`Contents/scripts/siweighteditor_improve/startup.py`
+  - 原因：
+    - `menu_setup()` が `cmds.menuItem(..., subMenu=True)` の戻り値（フルパス）を子項目の `parent` へ渡しておらず、起動タイミングや直前の親メニュー状態によって子項目 `SiWeightEditor Improve` が別の親へぶら下がり、空のサブメニューだけが `Windows` メニューに残ることがあった。
+    - `remove_menu()` が `cmds.deleteUI("siweighteditor_improve")` のみで失敗時に残骸を消し切れず、`_STARTUP_EXECUTED = True` により以降の再実行もスキップされていた。
+  - 修正内容：
+    - `remove_menu()` で `Windows` メニュー直下の `siweighteditor_improve_*` 関連項目をフルパスで確実に削除するよう改善。
+    - `menu_setup()` で `subMenu=True` の戻り値（`folder_menu`）を子 `menuItem` の `parent` へ明示指定し、`cmds.setParent("..", menu=True)` で親メニュー状態を復元。
+    - `_is_menu_ready()` を新設してメニューの存在と子項目数を検証し、空サブメニューになっている場合は自動再構築するよう改善（`execute(force=True)` にも対応）。
+
+- **ウェイト無しメッシュ一覧バインド → モデル / ボーン修正（修正開始 → 修正完了）で再バインドされない不具合の修正**
+  - 対象：`Contents/scripts/siweighteditor_improve/tools/model_edit_window.py`、`Contents/scripts/siweighteditor_improve/tools/rig_cleanup_helper.py`
+  - 原因：
+    - `_make_safe_filename()` が短縮名のみで JSON を保存していたため、別グループ配下に同名メッシュがあるとステップ 1 で JSON が上書き衝突し、ステップ 2 で片方がバインドされなかった。
+    - `finish_modeling_selected()` が保存フォルダ内の過去「復元済」JSON も含めて一括処理し、1 件のエラーでループ全体が即中断していた。また短縮名フォールバック（`cmds.ls(mesh_short)`）がポリゴンメッシュ以外の同名グループや非表示バックアップを誤って取得するケースがあった。
+    - `finish_modeling_and_restore()` で `bindMethod` の明示引き継ぎ・パラメータ範囲安全化・再バインド後の実在検証が不足しており、`bind_unweighted_meshes_to_joints()` では親子構造のメッシュが単一スキンクラスタへ巻き込まれるケースがあった。
+    - `find_meshes_sharing_skeleton()` がジョイント階層の途中に挟まる非ジョイント `transform`（グループ）を越えてルートジョイントまで遡れなかった。
+  - 修正内容：
+    - `_make_safe_filename()` にフルパス由来の 8 桁ハッシュ（例：`ribbon_03__xxxxxxxx.json`）を付与して同名メッシュの衝突を解消し、同一フルパスの旧形式 JSON は自動整理。
+    - `_resolve_target_mesh_for_record()` を新設し、ポリゴンメッシュシェイプを持つトランスフォームのみを対象に「フルパス一致 ＞ 表示中メッシュ ＞ 親階層類似度」の順で厳密解決。
+    - `finish_modeling_selected()` で「修正中（`editing`）」レコードがある場合は修正中のみを対象とし、メッシュ単位の `try/except` により 1 件失敗しても残りの全メッシュの再バインドを継続（失敗分は `editing` のまま保持し、ステータス＆ログ表示へ原因を明示）。
+    - `finish_modeling_and_restore()` に `bindMethod` 引き継ぎ・`dropoffRate`（0.1〜10.0）／`maxInfluences`（1 以上）安全クランプ・重複インフルエンス除去・安全フラグ自動リトライ・終了前の `_get_skin_cluster()` 実在検証を追加。
+    - `bind_unweighted_meshes_to_joints()` で未使用中間シェイプ整理・子トランスフォーム一時退避（`TemporaryReparent`）・作成後の実在検証を追加し、`find_meshes_sharing_skeleton()` が途中の非ジョイントグループを通過して最上位ジョイントまで遡れるよう改善（Maya 2025 実機 8 テスト全 PASS 確認済み）。

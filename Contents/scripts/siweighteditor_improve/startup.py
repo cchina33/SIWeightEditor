@@ -6,20 +6,69 @@ import maya.utils
 from . import siweighteditor
 from . import qt
 
-def remove_menu():
-    """メインウィンドウメニューに登録した SiWeightEditor Improve 項目を削除する。"""
-    for item_name in ('siweighteditor_improve_open', 'siweighteditor_improve_folder', 'siweighteditor_improve_divider'):
+MAIN_WINDOW_MENU = 'MayaWindow|mainWindowMenu'
+MENU_PREFIX = 'siweighteditor_improve_'
+_STARTUP_EXECUTED = False
+
+
+def _delete_menu_ui(item_path):
+    """メニュー項目またはサブメニューを種類に応じて安全に削除する。"""
+    for kwargs in ({'menuItem': True}, {'menu': True}, {}):
         try:
-            if cmds.menuItem(item_name, exists=True):
-                cmds.deleteUI(item_name, menuItem=True)
+            if cmds.menuItem(item_path, exists=True) or cmds.menu(item_path, exists=True):
+                cmds.deleteUI(item_path, **kwargs)
+            if not (cmds.menuItem(item_path, exists=True) or cmds.menu(item_path, exists=True)):
+                return True
         except Exception:
             pass
+    return False
+
+
+def remove_menu():
+    """メインウィンドウメニューに登録した SiWeightEditor Improve 項目を確実に削除する。"""
+    global _STARTUP_EXECUTED
+    _STARTUP_EXECUTED = False
+
+    if cmds.menu(MAIN_WINDOW_MENU, exists=True):
+        try:
+            items = cmds.menu(MAIN_WINDOW_MENU, query=True, itemArray=True) or []
+        except Exception:
+            items = []
+        for item in list(items):
+            short_name = str(item).split('|')[-1]
+            if short_name.startswith(MENU_PREFIX):
+                full_path = '{0}|{1}'.format(MAIN_WINDOW_MENU, short_name)
+                _delete_menu_ui(full_path)
+
+    for item_name in ('siweighteditor_improve_open', 'siweighteditor_improve_folder', 'siweighteditor_improve_divider'):
+        _delete_menu_ui(item_name)
+
+
+def _is_menu_ready():
+    """Windows メニュー内にサブメニューおよび起動用子項目が正しく存在しているか確認する。"""
+    if not cmds.menu(MAIN_WINDOW_MENU, exists=True):
+        return False
+    try:
+        items = cmds.menu(MAIN_WINDOW_MENU, query=True, itemArray=True) or []
+    except Exception:
+        return False
+    for item in items:
+        short_name = str(item).split('|')[-1]
+        if short_name.startswith('siweighteditor_improve_folder'):
+            folder_path = '{0}|{1}'.format(MAIN_WINDOW_MENU, short_name)
+            try:
+                sub_items = cmds.menu(folder_path, query=True, itemArray=True) or []
+                if sub_items:
+                    return True
+            except Exception:
+                pass
+    return False
 
 
 def menu_setup():
     # Maya ウィンドウが見つからない場合は処理しない
     if not qt.get_maya_window():
-        return
+        return False
 
     cmd = '''
     buildViewMenu MayaWindow|mainWindowMenu;
@@ -28,30 +77,39 @@ def menu_setup():
 
     mel.eval(cmd)
 
-    # 多重登録を防ぐため既存メニューがあれば先に削除する
+    if not cmds.menu(MAIN_WINDOW_MENU, exists=True):
+        return False
+
+    # 多重登録や空サブメニュー残骸を防ぐため既存メニューを先にすべて削除する
     remove_menu()
 
-    cmds.menuItem('siweighteditor_improve_divider', divider=True, parent='MayaWindow|mainWindowMenu')
-    cmds.menuItem(
+    cmds.menuItem('siweighteditor_improve_divider', divider=True, parent=MAIN_WINDOW_MENU)
+    folder_menu = cmds.menuItem(
         'siweighteditor_improve_folder',
         label='SiWeightEditor Improve',
         subMenu=True,
         tearOff=True,
-        parent='MayaWindow|mainWindowMenu'
+        parent=MAIN_WINDOW_MENU
     )
 
     cmds.menuItem(
         'siweighteditor_improve_open',
         label=jpn('SiWeightEditor Improve'),
         annotation="open SiWeightEditor Improve",
-        parent='siweighteditor_improve_folder',
+        parent=folder_menu,
         echoCommand=True,
         command=dedent(
             '''
                 import siweighteditor_improve.siweighteditor
                 siweighteditor_improve.siweighteditor.Option()
-            ''')
+            ''').strip()
     )
+
+    try:
+        cmds.setParent(MAIN_WINDOW_MENU, menu=True)
+    except Exception:
+        pass
+    return True
 
 
 def register_runtime_command(opt):
@@ -99,9 +157,6 @@ def register_siwieighteditor_runtime_command():
     register_runtime_command(opts)
 
 
-_STARTUP_EXECUTED = False
-
-
 def jpn(string):
     # Python 3 環境ではそのまま文字列を返し、Python 2 環境のみ cp932 へ変換する
     try:
@@ -114,8 +169,10 @@ def jpn(string):
 
 def execute(force=False):
     global _STARTUP_EXECUTED
-    if _STARTUP_EXECUTED and not force:
-        return
-    _STARTUP_EXECUTED = True
-    menu_setup()
+    if _STARTUP_EXECUTED and not force and _is_menu_ready():
+        return True
+    ok = menu_setup()
     register_siwieighteditor_runtime_command()
+    if ok:
+        _STARTUP_EXECUTED = True
+    return ok

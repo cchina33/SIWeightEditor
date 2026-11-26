@@ -466,13 +466,14 @@ def update_from_window(window, max_weight=100.0, decimals=1):
                 if max_arr[inf_id] > weight_max_map[joint_path]:
                     weight_max_map[joint_path] = max_arr[inf_id]
 
-    if not weight_sum_map:
+    if not weight_sum_map and not selected_joints:
         clear_state(delete_node=False)
         return
 
     aggregate_mode = STATE.get("aggregate_mode", "avg")
     inv_row_count = 1.0 / float(valid_row_count)
     influences_entries = []
+    added_joints = set()
     for joint_path, total_w in weight_sum_map.items():
         agg_weight = weight_max_map[joint_path] if aggregate_mode == "max" else total_w * inv_row_count
         if agg_weight <= WEIGHT_EPSILON:
@@ -484,10 +485,32 @@ def update_from_window(window, max_weight=100.0, decimals=1):
             "label": short_name,
             "weight": agg_weight,
             "selected": joint_path in selected_joints,
+            "is_zero": False,
         })
+        added_joints.add(joint_path)
 
-    # ウェイトが大きい順に並べる
-    influences_entries.sort(key=lambda entry: entry["weight"], reverse=True)
+    # テーブルで選択中のボーン列がウェイト 0 の場合もラベル・マーカー表示対象に含める（接続ラインは非表示）
+    for joint_path in sorted(selected_joints):
+        if joint_path in added_joints:
+            continue
+        if not joint_path or not cmds.objExists(joint_path):
+            continue
+        short_name = joint_path.split("|")[-1].split(":")[-1]
+        influences_entries.append({
+            "joint": joint_path,
+            "label": short_name,
+            "weight": 0.0,
+            "selected": True,
+            "is_zero": True,
+        })
+        added_joints.add(joint_path)
+
+    if not influences_entries:
+        clear_state(delete_node=False)
+        return
+
+    # ウェイトが大きい順に並べる（ウェイト 0 の選択ボーンは末尾側へ配置）
+    influences_entries.sort(key=lambda entry: (not entry.get("is_zero", False), entry["weight"]), reverse=True)
 
     STATE["mesh_vertices"] = _sample_mesh_vertices(mesh_vtx_map, MAX_SAMPLE_VERTICES)
     STATE["influences"] = influences_entries
